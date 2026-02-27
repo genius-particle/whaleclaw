@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,11 +24,11 @@ from whaleclaw.utils.log import get_logger
 
 _IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 _FILE_RE = re.compile(r"(?<!!)\[([^\]]+)\]\((/[^)]+)\)")
-_BARE_PATH_RE = re.compile(
-    r"(?:^|[\s`])(/[\w./-]+\.(?:pptx|ppt|pdf|docx|doc|xlsx|xls))(?:[\s`]|$)",
-    re.MULTILINE,
-)
 _FILE_EXTS = {
+    ".txt",
+    ".md",
+    ".json",
+    ".log",
     ".pptx",
     ".ppt",
     ".pdf",
@@ -39,11 +40,33 @@ _FILE_EXTS = {
     ".zip",
     ".tar",
     ".gz",
+    ".mp3",
+    ".wav",
+    ".aif",
+    ".aiff",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".flac",
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".avi",
+    ".mkv",
+    ".webm",
 }
+_BARE_PATH_RE = re.compile(
+    r"(?:^|[\s`])(/[\w./-]+\.(?:"
+    + "|".join(ext.lstrip(".") for ext in sorted(_FILE_EXTS))
+    + r"))(?:[\s`]|$)",
+    re.MULTILINE,
+)
 
 if TYPE_CHECKING:
     from whaleclaw.config.schema import WhaleclawConfig
     from whaleclaw.memory.manager import MemoryManager
+    from whaleclaw.sessions.group_compressor import SessionGroupCompressor
     from whaleclaw.sessions.manager import SessionManager
     from whaleclaw.tools.registry import ToolRegistry
 
@@ -76,6 +99,8 @@ class FeishuBot:
         self._tool_registry: ToolRegistry | None = None
         self._memory_manager: MemoryManager | None = None
         self._hook_manager: HookManager | None = None
+        self._group_compressor: SessionGroupCompressor | None = None
+        self._compression_ready_fn: Callable[[], bool] | None = None
 
     def set_bot_open_id(self, bot_open_id: str) -> None:
         self._bot_open_id = bot_open_id
@@ -87,6 +112,8 @@ class FeishuBot:
         registry: ToolRegistry,
         memory_manager: MemoryManager | None = None,
         hook_manager: HookManager | None = None,
+        group_compressor: SessionGroupCompressor | None = None,
+        compression_ready_fn: Callable[[], bool] | None = None,
     ) -> None:
         """Inject Agent dependencies so handle_message can run the full loop."""
         self._whaleclaw_config = config
@@ -94,6 +121,8 @@ class FeishuBot:
         self._tool_registry = registry
         self._memory_manager = memory_manager
         self._hook_manager = hook_manager
+        self._group_compressor = group_compressor
+        self._compression_ready_fn = compression_ready_fn
 
     async def handle_event(
         self, event_type: str, body: dict[str, Any]
@@ -147,10 +176,12 @@ class FeishuBot:
 
         log.info(
             "feishu.message",
+            message_id=msg_id,
             chat_type=chat_type,
             open_id=open_id,
             msg_type=msg_type,
             text_len=len(text),
+            text_preview=(" ".join(text.split())[:80]),
             images=len(images),
         )
 
@@ -178,6 +209,14 @@ class FeishuBot:
         from whaleclaw.gateway.protocol import make_message, make_status
         from whaleclaw.gateway.ws import broadcast_all
         from whaleclaw.providers.router import ModelRouter
+
+        if self._compression_ready_fn is not None and not self._compression_ready_fn():
+            await self._client.reply_message(
+                reply_to_msg_id,
+                "text",
+                json.dumps({"text": "会话压缩中，请稍后再试。"}, ensure_ascii=False),
+            )
+            return
 
         session = await self._session_manager.get_or_create("feishu", peer_id)
         cmd_reply = await self._handle_command(text, session)
@@ -226,6 +265,9 @@ class FeishuBot:
                 session_store=self._session_manager._store,  # noqa: SLF001
                 memory_manager=self._memory_manager,
                 extra_memory=extra_memory,
+                trigger_event_id=reply_to_msg_id,
+                trigger_text_preview=text,
+                group_compressor=self._group_compressor,
             )
             log.info("feishu.agent_reply", reply_len=len(reply), preview=reply[:200])
         except Exception as exc:

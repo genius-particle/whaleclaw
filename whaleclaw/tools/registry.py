@@ -24,7 +24,7 @@ class ToolRegistry:
         """Return definitions for all registered tools."""
         return [t.definition for t in self._tools.values()]
 
-    def to_llm_schemas(self) -> list[ToolSchema]:
+    def to_llm_schemas(self, include_names: set[str] | None = None) -> list[ToolSchema]:
         """Convert all tools to LLM-native ``ToolSchema`` objects.
 
         These are passed via the ``tools`` API parameter — not injected
@@ -33,6 +33,8 @@ class ToolRegistry:
         schemas: list[ToolSchema] = []
         for tool in self._tools.values():
             defn = tool.definition
+            if include_names is not None and defn.name not in include_names:
+                continue
             properties: dict[str, object] = {}
             required: list[str] = []
             for p in defn.parameters:

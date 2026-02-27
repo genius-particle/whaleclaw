@@ -1,15 +1,12 @@
-"""Context window management — lazy, on-demand compression.
+"""Context window management with fixed-token hierarchical compression.
 
-Compression is applied in stages, stopping as soon as we're within budget:
-  Stage 0: No compression — if everything fits, ship it as-is
-  Stage 1: Compress tool outputs only (biggest per-message savings)
-  Stage 2: Compress tool-call annotations
-  Stage 3: Compress old user/assistant messages (light — keep first 2 lines)
-  Stage 4: Hard truncate — drop oldest messages (no summary injected)
-
-When L0/L1 summaries exist in the DB, ``trim_with_summaries`` injects them
-into the prompt before Stage 1-4, giving the model awareness of prior
-context even after truncation.
+Policy (user-defined):
+- Keep the latest 3 conversation groups unchanged.
+- Groups ranked from 4th to 10th latest use L1 compression.
+- Groups older than the 10th latest use L0 compression.
+- Target total input budget is ~1600 tokens (best effort).
+- If still over budget after physical truncation, compact dropped range into
+  a single summary message and feed it back.
 """
 
 from __future__ import annotations
@@ -17,12 +14,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from whaleclaw.providers.base import Message
-from whaleclaw.utils.log import get_logger
 
 if TYPE_CHECKING:
     from whaleclaw.sessions.store import SummaryRow
-
-log = get_logger(__name__)
 
 MODEL_MAX_CONTEXT: dict[str, int] = {
     "claude-sonnet-4-20250514": 200_000,
@@ -51,8 +45,10 @@ MODEL_MAX_CONTEXT: dict[str, int] = {
 }
 
 _DEFAULT_CONTEXT = 128_000
-_REPLY_RESERVE = 8_000
-RECENT_PROTECTED = 6
+TARGET_CONTENT_TOKENS = 1600
+RECENT_PROTECTED = 3
+_L1_WINDOW = 7
+_MIN_CONTENT_BUDGET = 200
 
 
 def _estimate_tokens(text: str) -> int:
@@ -66,164 +62,183 @@ def _total_tokens(msgs: list[Message]) -> int:
     return sum(_estimate_tokens(m.content) for m in msgs)
 
 
-def _already_compressed(msg: Message) -> bool:
-    return msg.content.endswith(" ...") or msg.content.endswith("已压缩)")
+def _clip_tokens(text: str, max_tokens: int) -> str:
+    if max_tokens <= 0:
+        return ""
+    char_cap = max_tokens * 3
+    if len(text) <= char_cap:
+        return text
+    return text[:char_cap].rstrip() + " ..."
 
 
-def _is_tool_output(msg: Message) -> bool:
-    if _already_compressed(msg):
-        return False
-    return (
-        msg.content.startswith("[")
-        and "] " in msg.content[:60]
-        and msg.role == "assistant"
-    )
-
-
-def _is_tool_call_annotation(msg: Message) -> bool:
-    if _already_compressed(msg):
-        return False
-    return msg.role == "assistant" and msg.content.startswith("(调用工具:")
-
-
-def _compress_tool_output(msg: Message) -> Message:
-    """Compress tool output: keep first line + paths + status lines."""
-    text = msg.content
-    if _estimate_tokens(text) <= 300:
-        return msg
-
-    lines = text.split("\n")
-    kept = [lines[0][:200]]
-    for line in lines[1:]:
-        s = line.strip()
-        if not s:
-            continue
-        if (s.startswith("/") or "文件:" in s or "路径:" in s
-                or "成功" in s or "失败" in s or "ERROR" in s):
-            kept.append(s[:200])
-    compressed = "\n".join(kept[:10])
-    if len(compressed) >= len(text):
-        return msg
-    return Message(role=msg.role, content=compressed)
-
-
-def _compress_tool_annotation(msg: Message) -> Message:
-    if _estimate_tokens(msg.content) <= 80:
-        return msg
-    end = msg.content.find(")")
-    if end > 0:
-        return Message(role=msg.role, content=msg.content[:end + 1])
-    return msg
-
-
-def _compress_old_user_assistant(msg: Message) -> Message:
-    """Light compression: keep first 2 meaningful lines."""
-    if _already_compressed(msg):
-        return msg
+def _compress_l1(msg: Message) -> Message:
     text = msg.content.strip()
-    if _estimate_tokens(text) <= 300:
+    if _estimate_tokens(text) <= 120:
         return msg
-    lines = [l for l in text.split("\n") if l.strip()][:2]
-    preview = "\n".join(lines)
-    if len(preview) > 300:
-        preview = preview[:300]
-    return Message(role=msg.role, content=preview + " ...")
+
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    kept: list[str] = []
+    for ln in lines:
+        if ln.startswith("/") or "路径" in ln or "文件" in ln or "成功" in ln or "失败" in ln:
+            kept.append(ln[:160])
+        elif len(kept) < 4:
+            kept.append(ln[:180])
+        if len(kept) >= 6:
+            break
+
+    if not kept:
+        kept = [text[:240]]
+
+    body = "\n".join(kept)
+    return Message(role=msg.role, content=f"[L1压缩] {body} ...")
 
 
-def _build_summary_message(summaries: list[SummaryRow], budget: int) -> Message | None:
-    """Build a single system message from DB summaries, preferring L1 over L0.
+def _compress_l0(msg: Message) -> Message:
+    text = msg.content.strip()
+    if _estimate_tokens(text) <= 80:
+        return msg
 
-    If L1 fits within *budget*, use it.  Otherwise fall back to L0.
-    Returns None if no summaries available or none fit.
-    """
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    first = lines[0][:140] if lines else text[:140]
+    hints: list[str] = []
+    for ln in lines[1:]:
+        if ln.startswith("/") or "路径" in ln or "文件" in ln:
+            hints.append(ln[:120])
+        if len(hints) >= 2:
+            break
+
+    body = first if not hints else first + " | " + " ; ".join(hints)
+    return Message(role=msg.role, content=f"[L0压缩] {body} ...")
+
+
+def _build_summary_message(summaries: list[SummaryRow], budget: int) -> str:
+    if budget <= 20 or not summaries:
+        return ""
+
     l0_parts: list[str] = []
     l1_parts: list[str] = []
-
     for s in summaries:
-        if s.level == "L0":
-            l0_parts.append(s.content)
-        elif s.level == "L1":
-            l1_parts.append(s.content)
+        if s.level == "L0" and s.content.strip():
+            l0_parts.append(s.content.strip())
+        elif s.level == "L1" and s.content.strip():
+            l1_parts.append(s.content.strip())
 
-    if l1_parts:
-        l1_text = "\n\n".join(l1_parts)
-        if _estimate_tokens(l1_text) <= budget:
-            return Message(
-                role="system",
-                content=f"(早期对话概要：\n{l1_text}\n--- 以下为完整对话 ---)",
-            )
+    preferred = "\n".join(l1_parts) if l1_parts else "\n".join(l0_parts)
+    if not preferred:
+        return ""
+    return _clip_tokens(preferred, budget)
 
-    if l0_parts:
-        l0_text = " ".join(l0_parts)
-        if _estimate_tokens(l0_text) <= budget:
-            return Message(
-                role="system",
-                content=f"(早期对话摘要：{l0_text}\n--- 以下为完整对话 ---)",
-            )
 
-    return None
+def _build_compacted_range_message(
+    dropped: list[Message],
+    *,
+    budget: int,
+    summaries: list[SummaryRow],
+) -> Message | None:
+    if budget <= 40 or not dropped:
+        return None
+
+    prefix = _build_summary_message(summaries, max(0, budget // 2))
+    parts: list[str] = []
+    if prefix:
+        parts.append(prefix)
+
+    lines: list[str] = []
+    for m in dropped[-20:]:
+        role = "用户" if m.role == "user" else "助手" if m.role == "assistant" else m.role
+        text = m.content.split("\n", 1)[0].strip()
+        if not text:
+            continue
+        lines.append(f"- [{role}] {text[:100]}")
+    if lines:
+        parts.append("\n".join(lines))
+
+    if not parts:
+        return None
+
+    body = _clip_tokens("\n".join(parts), budget)
+    if not body:
+        return None
+    return Message(role="assistant", content=f"[历史压缩摘要]\n{body}")
+
+
+def _keep_recent_with_budget(recent: list[Message], budget: int) -> tuple[list[Message], list[Message]]:
+    kept_rev: list[Message] = []
+    used = 0
+    for msg in reversed(recent):
+        cost = _estimate_tokens(msg.content)
+        if used + cost > budget:
+            break
+        kept_rev.append(msg)
+        used += cost
+    kept = list(reversed(kept_rev))
+    dropped = recent[: len(recent) - len(kept)]
+    return kept, dropped
+
+
+def _group_by_turn(messages: list[Message]) -> list[list[Message]]:
+    """Group non-system messages by user turns.
+
+    A new group starts when a ``user`` message appears; following assistant/tool
+    messages belong to that same group until next user message.
+    """
+    groups: list[list[Message]] = []
+    current: list[Message] = []
+    for msg in messages:
+        if msg.role == "user":
+            if current:
+                groups.append(current)
+            current = [msg]
+            continue
+        if not current:
+            current = [msg]
+        else:
+            current.append(msg)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _flatten_groups(groups: list[list[Message]]) -> list[Message]:
+    out: list[Message] = []
+    for g in groups:
+        out.extend(g)
+    return out
+
+
+def _compress_group(group: list[Message], *, level: str) -> list[Message]:
+    if level == "L1":
+        return [_compress_l1(m) for m in group]
+    return [_compress_l0(m) for m in group]
+
+
+def _keep_recent_groups_with_budget(
+    recent_groups: list[list[Message]],
+    budget: int,
+) -> tuple[list[list[Message]], list[list[Message]]]:
+    kept_rev: list[list[Message]] = []
+    used = 0
+    for group in reversed(recent_groups):
+        cost = _total_tokens(group)
+        if used + cost > budget:
+            break
+        kept_rev.append(group)
+        used += cost
+    kept = list(reversed(kept_rev))
+    dropped = recent_groups[: len(recent_groups) - len(kept)]
+    return kept, dropped
 
 
 class ContextWindow:
-    """On-demand, lazy context window compression."""
+    """Fixed-budget hierarchical context trimmer."""
 
     @staticmethod
     def get_max_context(model: str) -> int:
         return MODEL_MAX_CONTEXT.get(model, _DEFAULT_CONTEXT)
 
-    def trim(
-        self, messages: list[Message], model: str,
-    ) -> list[Message]:
-        """Fit messages into budget. Stage 4 = hard truncate (no summary)."""
-        max_ctx = self.get_max_context(model)
-
-        system: list[Message] = []
-        non_system: list[Message] = []
-        for m in messages:
-            (system if m.role == "system" else non_system).append(m)
-
-        budget = max_ctx - _total_tokens(system) - _REPLY_RESERVE
-        if budget < 2000:
-            budget = 2000
-
-        if _total_tokens(non_system) <= budget:
-            return [*system, *non_system]
-
-        protected = min(RECENT_PROTECTED, len(non_system))
-        split = len(non_system) - protected
-
-        old = list(non_system[:split])
-        recent = list(non_system[split:])
-
-        old = self._stage_compress(old, recent, budget, _is_tool_output, _compress_tool_output)
-        if _total_tokens(old) + _total_tokens(recent) <= budget:
-            return [*system, *old, *recent]
-
-        old = self._stage_compress(old, recent, budget, _is_tool_call_annotation, _compress_tool_annotation)
-        if _total_tokens(old) + _total_tokens(recent) <= budget:
-            return [*system, *old, *recent]
-
-        old = self._stage_compress(
-            old, recent, budget,
-            lambda m: m.role in ("user", "assistant"),
-            _compress_old_user_assistant,
-        )
-        if _total_tokens(old) + _total_tokens(recent) <= budget:
-            return [*system, *old, *recent]
-
-        # Stage 4: hard truncate — keep as many recent messages as fit
-        all_msgs = [*old, *recent]
-        kept: list[Message] = []
-        used = 0
-        for msg in reversed(all_msgs):
-            cost = _estimate_tokens(msg.content)
-            if used + cost > budget:
-                break
-            kept.append(msg)
-            used += cost
-        kept.reverse()
-
-        return [*system, *kept]
+    def trim(self, messages: list[Message], model: str) -> list[Message]:
+        del model  # fixed policy does not depend on model max context
+        return self._trim_core(messages, summaries=[])
 
     def trim_with_summaries(
         self,
@@ -231,89 +246,87 @@ class ContextWindow:
         model: str,
         summaries: list[SummaryRow],
     ) -> list[Message]:
-        """Fit messages into budget, injecting DB summaries when truncation occurs.
+        del model
+        return self._trim_core(messages, summaries=summaries)
 
-        Summaries are loaded hierarchically: try L1 first (richer context),
-        fall back to L0 (cheaper) if L1 doesn't fit the remaining budget.
-        """
-        max_ctx = self.get_max_context(model)
-
+    def _trim_core(
+        self,
+        messages: list[Message],
+        *,
+        summaries: list[SummaryRow],
+    ) -> list[Message]:
         system: list[Message] = []
         non_system: list[Message] = []
         for m in messages:
             (system if m.role == "system" else non_system).append(m)
 
-        budget = max_ctx - _total_tokens(system) - _REPLY_RESERVE
-        if budget < 2000:
-            budget = 2000
+        if not non_system:
+            return system
 
-        if _total_tokens(non_system) <= budget:
+        # User requirement: only cap message content (user/assistant/tool),
+        # not system prompt and not tool schema payload in API body.
+        non_budget = max(_MIN_CONTENT_BUDGET, TARGET_CONTENT_TOKENS)
+
+        if _total_tokens(non_system) <= non_budget:
             return [*system, *non_system]
 
-        protected = min(RECENT_PROTECTED, len(non_system))
-        split = len(non_system) - protected
-        old = list(non_system[:split])
-        recent = list(non_system[split:])
+        groups = _group_by_turn(non_system)
+        recent_n = min(RECENT_PROTECTED, len(groups))
+        recent_groups = list(groups[-recent_n:])
 
-        old = self._stage_compress(old, recent, budget, _is_tool_output, _compress_tool_output)
-        if _total_tokens(old) + _total_tokens(recent) <= budget:
-            return [*system, *old, *recent]
+        middle_end = max(0, len(groups) - recent_n)
+        middle_start = max(0, middle_end - _L1_WINDOW)
+        middle_groups = list(groups[middle_start:middle_end])
+        old_groups = list(groups[:middle_start])
 
-        old = self._stage_compress(old, recent, budget, _is_tool_call_annotation, _compress_tool_annotation)
-        if _total_tokens(old) + _total_tokens(recent) <= budget:
-            return [*system, *old, *recent]
+        old_c_groups = [_compress_group(g, level="L0") for g in old_groups]
+        middle_c_groups = [_compress_group(g, level="L1") for g in middle_groups]
+        core_groups = [*old_c_groups, *middle_c_groups]
 
-        old = self._stage_compress(
-            old, recent, budget,
-            lambda m: m.role in ("user", "assistant"),
-            _compress_old_user_assistant,
+        recent_kept_groups, recent_dropped_groups = _keep_recent_groups_with_budget(
+            recent_groups, non_budget
         )
-        if _total_tokens(old) + _total_tokens(recent) <= budget:
-            return [*system, *old, *recent]
+        recent_kept = _flatten_groups(recent_kept_groups)
+        used = _total_tokens(recent_kept)
 
-        # Stage 4: hard truncate + inject summaries
-        all_msgs = [*old, *recent]
-        kept: list[Message] = []
-        used = 0
-        for msg in reversed(all_msgs):
-            cost = _estimate_tokens(msg.content)
-            if used + cost > budget:
+        core_kept_rev: list[list[Message]] = []
+        for group in reversed(core_groups):
+            cost = _total_tokens(group)
+            if used + cost > non_budget:
                 break
-            kept.append(msg)
+            core_kept_rev.append(group)
             used += cost
-        kept.reverse()
+        core_kept_groups = list(reversed(core_kept_rev))
+        core_kept = _flatten_groups(core_kept_groups)
 
-        result = list(system)
+        dropped_group_count = len(core_groups) - len(core_kept_groups)
+        dropped_groups = [*core_groups[:dropped_group_count], *recent_dropped_groups]
+        dropped = _flatten_groups(dropped_groups)
 
-        if summaries:
-            remaining_budget = budget - used
-            summary_budget = min(remaining_budget // 3, 2000)
-            if summary_budget > 50:
-                summary_msg = _build_summary_message(summaries, summary_budget)
-                if summary_msg:
-                    result.append(summary_msg)
+        trimmed = [*core_kept, *recent_kept]
 
-        result.extend(kept)
-        return result
+        headroom = non_budget - _total_tokens(trimmed)
+        compact_budget = min(220, max(0, headroom))
+        if dropped and compact_budget < 80:
+            target = 120
+            while compact_budget < target and len(trimmed) > len(recent_kept):
+                removed = trimmed.pop(0)
+                compact_budget += _estimate_tokens(removed.content)
+            compact_budget = min(220, compact_budget)
 
-    @staticmethod
-    def _stage_compress(
-        old: list[Message],
-        recent: list[Message],
-        budget: int,
-        match_fn: object,
-        compress_fn: object,
-    ) -> list[Message]:
-        """Compress matching messages in old zone one by one, stopping when under budget."""
-        from typing import Callable
-        _match = match_fn  # type: Callable[[Message], bool]
-        _compress = compress_fn  # type: Callable[[Message], Message]
+        compacted = _build_compacted_range_message(
+            dropped,
+            budget=compact_budget,
+            summaries=summaries,
+        )
+        has_compacted = compacted is not None
+        if compacted is not None:
+            trimmed = [compacted, *trimmed]
 
-        recent_cost = _total_tokens(recent)
-        result = list(old)
-        for i, msg in enumerate(result):
-            if _total_tokens(result) + recent_cost <= budget:
-                break
-            if _match(msg):
-                result[i] = _compress(msg)
-        return result
+        while _total_tokens(trimmed) > non_budget and len(trimmed) > len(recent_kept):
+            if has_compacted and len(trimmed) > len(recent_kept) + 1:
+                trimmed.pop(1)
+                continue
+            trimmed.pop(0)
+
+        return [*system, *trimmed]

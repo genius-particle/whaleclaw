@@ -52,6 +52,55 @@ async def test_run_agent_returns_reply() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_agent_retries_once_on_empty_reply_then_recovers() -> None:
+    call_count = 0
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],  # noqa: ARG001
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return AgentResponse(content="", model="test-model", input_tokens=0, output_tokens=0)
+        return AgentResponse(content="请告诉我你要我做什么。", model="test-model")
+
+    router = _make_router(chat_fn=fake_chat)
+    result = await run_agent(
+        message="？？？",
+        session_id="test-empty-retry",
+        config=WhaleclawConfig(),
+        router=router,
+    )
+    assert result == "请告诉我你要我做什么。"
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_agent_returns_fallback_after_two_empty_replies() -> None:
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],  # noqa: ARG001
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        return AgentResponse(content="", model="test-model", input_tokens=0, output_tokens=0)
+
+    router = _make_router(chat_fn=fake_chat)
+    result = await run_agent(
+        message="？？？",
+        session_id="test-empty-fallback",
+        config=WhaleclawConfig(),
+        router=router,
+    )
+    assert result == "我这边没收到模型有效回复。请再发一次需求，我会继续处理。"
+
+
+@pytest.mark.asyncio
 async def test_run_agent_streams() -> None:
     mock_response = AgentResponse(
         content="Hello world",
@@ -940,7 +989,7 @@ async def test_run_agent_truncates_external_memory_when_compressor_unavailable()
 
 
 @pytest.mark.asyncio
-async def test_run_agent_compresses_external_memory_even_when_short() -> None:
+async def test_run_agent_keeps_short_external_memory_without_compress() -> None:
     captured_messages: list[Any] = []
 
     async def fake_chat(
@@ -971,5 +1020,5 @@ async def test_run_agent_compresses_external_memory_even_when_short() -> None:
         m for m in captured_messages
         if m.role == "system" and "协作网络的外部经验候选" in m.content
     )
-    assert "压缩后经验" in ext_msg.content
-    assert "原始经验文本" not in ext_msg.content
+    assert "压缩后经验" not in ext_msg.content
+    assert "原始经验文本" in ext_msg.content

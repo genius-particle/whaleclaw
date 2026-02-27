@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import re
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
     from whaleclaw.providers.router import ModelRouter
 
 log = get_logger(__name__)
+_PROFILE_COMPRESS_TIMEOUT_SECONDS = 8
 
 
 def _est_tokens(text: str) -> int:
@@ -183,6 +186,7 @@ class MemoryManager:
         self._pending_by_source: dict[str, list[str]] = defaultdict(list)
         self._pending_since: dict[str, datetime] = {}
         self._pending_last_flush: dict[str, datetime] = {}
+        self._profile_compress_cache: dict[str, str] = {}
 
     def recall_policy(self, query: str) -> tuple[bool, bool]:
         """Return (should_recall, include_raw_detail)."""
@@ -206,14 +210,6 @@ class MemoryManager:
         used = 0
         recent = await self._store.list_recent(limit=300)
         if include_profile:
-            latest_l0 = next(
-                (
-                    e
-                    for e in recent
-                    if _is_profile_entry(e) and any(t == "level:L0" for t in e.tags)
-                ),
-                None,
-            )
             latest_l1 = next(
                 (
                     e
@@ -222,22 +218,14 @@ class MemoryManager:
                 ),
                 None,
             )
-            for title, entry in (
-                ("【长期记忆画像】", latest_l0),
-                ("【长期记忆细节】", latest_l1),
-            ):
-                if entry is None:
-                    continue
-                content = entry.content.strip()
-                if not content:
-                    continue
-                txt = f"{title}\n{content}"
-                need = _est_tokens(txt)
-                if used + need <= max_tokens:
-                    parts.append(txt)
-                    used += need
-                else:
-                    break
+            if latest_l1 is not None:
+                content = latest_l1.content.strip()
+                if content:
+                    txt = f"【长期记忆画像】\n{content}"
+                    need = _est_tokens(txt)
+                    if used + need <= max_tokens:
+                        parts.append(txt)
+                        used += need
 
         if include_raw:
             results = await self._store.search(query, limit=limit * 3, min_score=0.2)
@@ -273,16 +261,8 @@ class MemoryManager:
         router: ModelRouter | None = None,
         model_id: str = "",
     ) -> str:
-        """Build profile injection text from latest L0/L1, compressing by LLM if needed."""
+        """Build profile injection text from latest L1, compressing by LLM if needed."""
         recent = await self._store.list_recent(limit=300)
-        latest_l0 = next(
-            (
-                e
-                for e in recent
-                if _is_profile_entry(e) and any(t == "level:L0" for t in e.tags)
-            ),
-            None,
-        )
         latest_l1 = next(
             (
                 e
@@ -292,28 +272,65 @@ class MemoryManager:
             None,
         )
         blocks: list[str] = []
-        if latest_l0 and latest_l0.content.strip():
-            blocks.append(f"【长期记忆画像】\n{latest_l0.content.strip()}")
         if latest_l1 and latest_l1.content.strip():
-            blocks.append(f"【长期记忆细节】\n{latest_l1.content.strip()}")
+            blocks.append(f"【长期记忆画像】\n{latest_l1.content.strip()}")
         if not blocks:
             return ""
 
         profile_text = "\n\n".join(blocks)
-        if router and model_id:
-            compressed = await self._compress_profile_with_llm(
-                router=router,
-                model_id=model_id,
-                profile_text=profile_text,
-                max_tokens=max_tokens,
-            )
-            if compressed:
-                return compressed
-
-        # Fallback: keep original if within budget, otherwise physical truncation.
         if _est_tokens(profile_text) <= max_tokens:
             return profile_text
+
+        cache_key = self._profile_cache_key(
+            profile_text=profile_text,
+            model_id=model_id,
+            max_tokens=max_tokens,
+        )
+        cached = self._profile_compress_cache.get(cache_key)
+        if cached:
+            log.debug("memory.profile_compress_cache_hit", model=model_id)
+            return cached
+
+        if router and model_id:
+            try:
+                compressed = await asyncio.wait_for(
+                    self._compress_profile_with_llm(
+                        router=router,
+                        model_id=model_id,
+                        profile_text=profile_text,
+                        max_tokens=max_tokens,
+                    ),
+                    timeout=_PROFILE_COMPRESS_TIMEOUT_SECONDS,
+                )
+                if compressed:
+                    self._profile_cache_set(cache_key, compressed)
+                    return compressed
+            except TimeoutError:
+                log.warning(
+                    "memory.profile_compress_timeout",
+                    model=model_id,
+                    timeout_s=_PROFILE_COMPRESS_TIMEOUT_SECONDS,
+                )
+
+        # Fallback: physical truncation.
         return _truncate_to_tokens(profile_text, max_tokens)
+
+    @staticmethod
+    def _profile_cache_key(
+        *,
+        profile_text: str,
+        model_id: str,
+        max_tokens: int,
+    ) -> str:
+        digest = hashlib.sha256(profile_text.encode("utf-8")).hexdigest()[:16]
+        return f"{model_id}:{max_tokens}:{digest}"
+
+    def _profile_cache_set(self, key: str, value: str) -> None:
+        self._profile_compress_cache[key] = value
+        if len(self._profile_compress_cache) <= 64:
+            return
+        oldest_key = next(iter(self._profile_compress_cache))
+        self._profile_compress_cache.pop(oldest_key, None)
 
     async def _compress_profile_with_llm(
         self,
@@ -323,7 +340,7 @@ class MemoryManager:
         profile_text: str,
         max_tokens: int,
     ) -> str:
-        """Compress combined L0/L1 profile while preserving actionable rules."""
+        """Compress L1 profile while preserving actionable rules."""
         sys_prompt = (
             "你是记忆注入压缩器。请把输入的长期记忆压缩成更短版本。"
             "保留所有可执行规则、约束、优先级和关键身份信息。"
@@ -361,7 +378,7 @@ class MemoryManager:
         max_tokens: int = 1600,
         keep_profile_versions: int = 3,
     ) -> bool:
-        """Fallback profile update: classify new captured rule into L0/L1 and append."""
+        """Fallback profile update: append captured rule into L1 profile."""
         text = content.strip()
         if len(text) < 6:
             return False
@@ -369,8 +386,7 @@ class MemoryManager:
         sys_prompt = (
             "你是长期画像规则分类器。"
             "判断新输入是否是可执行的长期规则。"
-            "若是，选择唯一层级 L0 或 L1（不要双层）。"
-            "输出 JSON: {accept:boolean, layer:\"L0|L1\", rule:string}。"
+            "若是，输出 JSON: {accept:boolean, rule:string}。"
             "rule 必须精炼可执行，不超过 80 字。"
         )
         user_prompt = f"输入：{text}"
@@ -389,20 +405,11 @@ class MemoryManager:
         if obj is None:
             return False
         accept = bool(obj.get("accept", False))
-        layer = str(obj.get("layer", "")).strip().upper()
         rule = str(obj.get("rule", "")).strip()
-        if not accept or layer not in {"L0", "L1"} or not rule:
+        if not accept or not rule:
             return False
 
         recent = await self._store.list_recent(limit=300)
-        latest_l0 = next(
-            (
-                e
-                for e in recent
-                if _is_profile_entry(e) and any(t == "level:L0" for t in e.tags)
-            ),
-            None,
-        )
         latest_l1 = next(
             (
                 e
@@ -411,7 +418,7 @@ class MemoryManager:
             ),
             None,
         )
-        target = latest_l0 if layer == "L0" else latest_l1
+        target = latest_l1
         old_text = target.content.strip() if target is not None else ""
         if old_text and _normalize_text(rule) in _normalize_text(old_text):
             return False
@@ -421,7 +428,7 @@ class MemoryManager:
         await self._store.add(
             merged,
             source="memory_fallback",
-            tags=["memory_profile", f"level:{layer}", "curated", "fallback_rule"],
+            tags=["memory_profile", "level:L1", "curated", "fallback_rule"],
         )
         await self._prune_profiles(keep_profile_versions=max(1, keep_profile_versions))
         return True
@@ -569,7 +576,7 @@ class MemoryManager:
         keep_profile_versions: int = 3,
         max_raw_entries: int = 800,
     ) -> bool:
-        """Use LLM to organize raw memory into profile summaries (L0/L1)."""
+        """Use LLM to organize raw memory into L1 profile summary."""
         await self.flush_capture_buffer(force=True)
         recent = await self._store.list_recent(limit=max(organizer_max_raw_window + 50, 200))
         now = datetime.now(UTC)
@@ -598,12 +605,11 @@ class MemoryManager:
         sys_prompt = (
             "你是记忆整理器。"
             "请把用户原始记忆整理为稳定、去重、可长期引用的内容。"
-            "输出必须是 JSON 对象，字段为：l0, l1, style_directive, keep, drop。"
-            "其中 l0 最多 120 字，l1 最多 800 字，"
+            "输出必须是 JSON 对象，字段为：l1, style_directive, keep, drop。"
+            "其中 l1 最多 800 字，"
             "style_directive 是可选的全局回复风格指令（最多120字，纯行为约束，不含任务事实）。"
             "keep/drop 是字符串数组（用于解释保留/丢弃依据，简短即可）。"
-            "规则分层要求：高频全局规则放到 l0，细节规则放到 l1。"
-            "同一条规则只能出现在一个层级，不要在 l0 和 l1 重复。"
+            "要求：输出去重后的统一画像，不要重复表达。"
         )
         user_prompt = (
             "历史 L1 画像（可能为空）：\n"
@@ -622,20 +628,12 @@ class MemoryManager:
             log.warning("memory.organizer_invalid_json", model=model_id)
             return False
 
-        l0 = str(obj.get("l0", "")).strip()
         l1 = str(obj.get("l1", "")).strip()
         style_directive = str(obj.get("style_directive", "")).strip()
-        if not style_directive:
-            style_directive = _infer_style_from_l0(l0)
-        if not l0 or not l1:
+        if not l1:
             log.warning("memory.organizer_missing_fields", model=model_id)
             return False
 
-        await self._store.add(
-            l0[:2000],
-            source="memory_organizer",
-            tags=["memory_profile", "level:L0", "curated"],
-        )
         await self._store.add(
             l1[:8000],
             source="memory_organizer",
@@ -694,13 +692,20 @@ class MemoryManager:
 
     async def _prune_profiles(self, keep_profile_versions: int) -> None:
         entries = await self._store.list_recent(limit=1000)
-        for level in ("level:L0", "level:L1"):
-            items = [
-                e for e in entries
-                if _is_profile_entry(e) and any(t == level for t in e.tags)
-            ]
-            for stale in items[keep_profile_versions:]:
-                await self._store.delete(stale.id)
+        # Keep only recent L1 profiles; legacy L0 profiles are removed.
+        l1_items = [
+            e for e in entries
+            if _is_profile_entry(e) and any(t == "level:L1" for t in e.tags)
+        ]
+        for stale in l1_items[keep_profile_versions:]:
+            await self._store.delete(stale.id)
+
+        l0_items = [
+            e for e in entries
+            if _is_profile_entry(e) and any(t == "level:L0" for t in e.tags)
+        ]
+        for old in l0_items:
+            await self._store.delete(old.id)
 
     async def _prune_raw(self, max_raw_entries: int) -> None:
         entries = await self._store.list_recent(limit=max_raw_entries * 4)

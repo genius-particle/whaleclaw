@@ -66,6 +66,8 @@ createApp({
     const loginPassword = ref('');
     const loginToken = ref('');
     const loginError = ref('');
+    const compressionReady = ref(true);
+    const compressionRunning = ref(false);
 
     const sessions = ref([]);
     const activeSessionId = ref('');
@@ -126,6 +128,7 @@ createApp({
 
     let ws = null;
     let streamingMessage = null;
+    let _compressionPollTimer = null;
 
     /* ── API helpers ── */
     const apiBase = window.location.origin;
@@ -569,6 +572,7 @@ createApp({
     function sendMessage() {
       const text = inputText.value.trim();
       const imgs = pendingImages.value;
+      if (!compressionReady.value) return;
       if ((!text && !imgs.length) || !ws || ws.readyState !== 1) return;
 
       let displayHtml = renderMarkdown(text);
@@ -819,8 +823,24 @@ createApp({
     }
 
     onMounted(async () => {
+      const updateCompressionState = (status) => {
+        compressionReady.value = status.compression_ready !== false;
+        compressionRunning.value = status.compression_running === true;
+      };
+      const pollCompressionState = () => {
+        clearTimeout(_compressionPollTimer);
+        if (compressionReady.value) return;
+        _compressionPollTimer = setTimeout(async () => {
+          try {
+            const s = await fetch(`${apiBase}/api/status`).then((r) => r.json());
+            updateCompressionState(s);
+          } catch { /* ignore */ }
+          pollCompressionState();
+        }, 3000);
+      };
       try {
         const status = await fetch(`${apiBase}/api/status`).then((r) => r.json());
+        updateCompressionState(status);
         if (status.status === 'ok') {
           authMode.value = status.auth_mode || 'none';
           if (authMode.value === 'none') {
@@ -831,6 +851,7 @@ createApp({
             if (!needLogin.value) await init();
           }
         }
+        pollCompressionState();
       } catch {
         /* Gateway unreachable — assume no auth, try to init */
         try { await init(); } catch { /* ignore */ }
@@ -839,6 +860,7 @@ createApp({
 
     return {
       theme, token, needLogin, authMode, loginPassword, loginToken, loginError, doLogin, doLogout,
+      compressionReady, compressionRunning,
       sessions, activeSessionId, activeSession, messages,
       inputText, isStreaming, showSettings, showSidebar, pendingImages,
       currentModel, thinkingLevel, availableModels, defaultModel, groupedModels, messagesEl,
@@ -996,6 +1018,9 @@ createApp({
           </div>
 
           <div class="input-area" @drop="onDrop" @dragover="onDragOver">
+            <div v-if="!compressionReady" style="font-size:12px;color:#f59e0b;padding:0 12px 8px;">
+              {{ compressionRunning ? '会话压缩中，请稍后发送消息…' : '压缩尚未就绪，请稍后重试。' }}
+            </div>
             <div v-if="pendingImages.length" class="image-preview-strip">
               <div v-for="(img, idx) in pendingImages" :key="idx" class="image-preview-item">
                 <img :src="img.dataUrl" />
@@ -1011,9 +1036,10 @@ createApp({
                 placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 可粘贴/拖拽图片)"
                 @keydown="handleKeydown"
                 @paste="onPaste"
+                :disabled="!compressionReady"
                 rows="1"
               ></textarea>
-              <button class="btn-send" :disabled="isStreaming || (!inputText.trim() && !pendingImages.length)" @click="sendMessage">
+              <button class="btn-send" :disabled="!compressionReady || isStreaming || (!inputText.trim() && !pendingImages.length)" @click="sendMessage">
                 发送
               </button>
             </div>

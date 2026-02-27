@@ -179,6 +179,7 @@ class OpenAICompatProvider(LLMProvider):
         max_attempts = self.max_network_retries + 1
 
         for attempt in range(1, max_attempts + 1):
+            t0 = asyncio.get_event_loop().time()
             collected: list[str] = []
             input_tokens = 0
             output_tokens = 0
@@ -259,12 +260,15 @@ class OpenAICompatProvider(LLMProvider):
 
             full_text = "".join(collected)
             tool_calls = tc_acc.build()
+            elapsed_ms = int((asyncio.get_event_loop().time() - t0) * 1000)
             log.debug(
                 f"{self.provider_name}.response",
                 model=model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 tool_calls=len(tool_calls),
+                elapsed_ms=elapsed_ms,
+                attempt=attempt,
             )
             return AgentResponse(
                 content=full_text,

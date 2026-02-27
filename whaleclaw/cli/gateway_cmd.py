@@ -55,4 +55,5 @@ def run(
         host=b,
         port=p,
         log_level="debug" if config.gateway.verbose else "info",
+        access_log=config.gateway.verbose,
     )

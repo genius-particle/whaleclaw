@@ -24,6 +24,8 @@ async def test_status_endpoint(app) -> None:  # noqa: ANN001
     data = resp.json()
     assert data["status"] == "ok"
     assert data["gateway"]["port"] == 18666
+    assert "compression_ready" in data
+    assert "compression_running" in data
 
 
 @pytest.mark.asyncio

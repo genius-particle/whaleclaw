@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -73,6 +74,76 @@ class TestFormatExceptionText:
 
     def test_non_empty_exception_message(self) -> None:
         assert _format_exception_text(RuntimeError("boom")) == "boom"
+
+
+def test_prepare_reply_payload_extracts_audio_markdown_file(tmp_path: Path) -> None:
+    audio = tmp_path / "reply.mp3"
+    audio.write_bytes(b"audio")
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+
+    text, images, files = bot._prepare_reply_payload(  # noqa: SLF001
+        f"已生成音频: [reply]({audio})"
+    )
+
+    assert "📎 reply" in text
+    assert images == []
+    assert files == [audio]
+
+
+def test_prepare_reply_payload_extracts_audio_bare_path(tmp_path: Path) -> None:
+    audio = tmp_path / "voice.wav"
+    audio.write_bytes(b"audio")
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+
+    text, images, files = bot._prepare_reply_payload(  # noqa: SLF001
+        f"音频文件在这里: {audio}"
+    )
+
+    assert "📎 voice.wav" in text
+    assert images == []
+    assert files == [audio]
+
+
+def test_prepare_reply_payload_extracts_aiff_bare_path(tmp_path: Path) -> None:
+    audio = tmp_path / "test_joke.aiff"
+    audio.write_bytes(b"audio")
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+
+    text, images, files = bot._prepare_reply_payload(  # noqa: SLF001
+        f"文件路径: `{audio}`"
+    )
+
+    assert "📎 test_joke.aiff" in text
+    assert images == []
+    assert files == [audio]
+
+
+def test_prepare_reply_payload_extracts_txt_bare_path(tmp_path: Path) -> None:
+    text_file = tmp_path / "note.txt"
+    text_file.write_text("hello", encoding="utf-8")
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+
+    text, images, files = bot._prepare_reply_payload(  # noqa: SLF001
+        f"输出在: {text_file}"
+    )
+
+    assert "📎 note.txt" in text
+    assert images == []
+    assert files == [text_file]
+
+
+def test_prepare_reply_payload_extracts_mp4_bare_path(tmp_path: Path) -> None:
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+
+    text, images, files = bot._prepare_reply_payload(  # noqa: SLF001
+        f"视频: `{video}`"
+    )
+
+    assert "📎 demo.mp4" in text
+    assert images == []
+    assert files == [video]
 
 
 @pytest.mark.asyncio

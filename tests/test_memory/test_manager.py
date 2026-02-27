@@ -127,7 +127,6 @@ class _FakeRouter:
     async def chat(self, model_id: str, messages: list[object], **kwargs: object) -> AgentResponse:  # noqa: ARG002
         self.calls += 1
         payload = {
-            "l0": "用户偏好：回答简洁明了。",
             "l1": "用户明确要求回答风格简洁明了，优先要点式回复。",
             "style_directive": "回答风格：简洁明了，先结论后细节，优先要点列表。",
             "keep": ["风格偏好稳定"],
@@ -179,7 +178,6 @@ async def test_organize_if_needed_generates_profile(
     assert router.calls == 1
     recent = await store.list_recent(limit=50)
     assert any("memory_profile" in e.tags for e in recent)
-    assert any("level:L0" in e.tags for e in recent)
     assert any("level:L1" in e.tags for e in recent)
     assert any("style:global" in e.tags for e in recent)
     style = await manager.get_global_style_directive()
@@ -187,14 +185,9 @@ async def test_organize_if_needed_generates_profile(
 
 
 @pytest.mark.asyncio
-async def test_recall_includes_latest_l0_and_l1_profiles(
+async def test_recall_includes_latest_l1_profile(
     manager: MemoryManager, store: SimpleMemoryStore
 ) -> None:
-    await store.add(
-        "用户长期偏好：回答先给结论。",
-        source="memory_organizer",
-        tags=["memory_profile", "level:L0", "curated"],
-    )
     await store.add(
         "PPT制作规则：封面图与内容页布局不同，内容页图片保持统一尺寸。",
         source="memory_organizer",
@@ -208,25 +201,25 @@ async def test_recall_includes_latest_l0_and_l1_profiles(
         include_raw=False,
     )
     assert "长期记忆画像" in recalled
-    assert "长期记忆细节" in recalled
     assert "PPT制作规则" in recalled
 
 
 @pytest.mark.asyncio
-async def test_build_profile_for_injection_compresses_even_when_short(
+async def test_build_profile_for_injection_prefers_l1_text_when_within_budget(
     manager: MemoryManager, store: SimpleMemoryStore
 ) -> None:
     await store.add(
         "用户长期偏好：回答先给结论。",
         source="memory_organizer",
-        tags=["memory_profile", "level:L0", "curated"],
+        tags=["memory_profile", "level:L1", "curated"],
     )
     out = await manager.build_profile_for_injection(
         max_tokens=1600,
         router=_FakeCompressRouter(),  # type: ignore[arg-type]
         model_id="zhipu/glm-4.7-flash",
     )
-    assert out == "压缩后画像"
+    assert "长期记忆画像" in out
+    assert "回答先给结论" in out
 
 
 @pytest.mark.asyncio
@@ -260,9 +253,9 @@ async def test_upsert_profile_from_capture_appends_rule_to_single_layer(
     await store.add(
         "用户偏好：回答简洁。",
         source="memory_organizer",
-        tags=["memory_profile", "level:L0", "curated"],
+        tags=["memory_profile", "level:L1", "curated"],
     )
-    router = _FakeRuleRouter({"accept": True, "layer": "L1", "rule": "PPT 内容页图片尺寸统一"})
+    router = _FakeRuleRouter({"accept": True, "rule": "PPT 内容页图片尺寸统一"})
     ok = await manager.upsert_profile_from_capture(
         "做PPT时内容页图片尺寸统一",
         router=router,  # type: ignore[arg-type]

@@ -28,7 +28,7 @@ from whaleclaw.sessions.compressor import ContextCompressor
 from whaleclaw.sessions.context_window import RECENT_PROTECTED, ContextWindow
 from whaleclaw.sessions.manager import Session, SessionManager
 from whaleclaw.sessions.store import SessionStore
-from whaleclaw.tools.base import ToolResult
+from whaleclaw.tools.base import ToolDefinition, ToolResult
 from whaleclaw.tools.registry import ToolRegistry
 from whaleclaw.types import StreamCallback
 from whaleclaw.utils.log import get_logger
@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from whaleclaw.cron.scheduler import CronScheduler
     from whaleclaw.memory.base import MemoryStore
     from whaleclaw.memory.manager import MemoryManager
+    from whaleclaw.sessions.group_compressor import SessionGroupCompressor
 
 log = get_logger(__name__)
 
@@ -47,6 +48,7 @@ _memory_organizer_tasks: dict[str, asyncio.Task[None]] = {}
 
 _MAX_OUTPUT_TOKENS = 200_000
 _EVOMAP_MAX_TOKENS = 1000
+_EXTRA_MEMORY_COMPRESS_TIMEOUT_SECONDS = 8
 
 _IMG_MD_RE = re.compile(r"!\[([^\]]*)\]\((/[^)]+)\)")
 
@@ -62,6 +64,94 @@ _TOOL_HINTS: dict[str, str] = {
     "memory_list": "查看长期记忆",
     "skill": "查找技能",
 }
+
+_CORE_NATIVE_TOOLS: set[str] = {
+    "bash",
+    "file_read",
+    "file_write",
+    "file_edit",
+    "browser",
+}
+_MAX_NATIVE_TOOLS = 8
+_TOOL_POLICY_KEYWORDS: dict[tuple[str, ...], set[str]] = {
+    ("提醒", "定时", "闹钟", "计划", "cron", "schedule"): {"cron", "reminder"},
+    ("记忆", "memory", "回忆", "记住"): {"memory_search", "memory_add", "memory_list"},
+    ("技能", "skill", "安装技能"): {"skill"},
+    ("会话", "session", "历史消息", "上下文"): {
+        "sessions_list",
+        "sessions_history",
+        "sessions_send",
+    },
+    ("桌面", "截图", "截屏", "screen", "screenshot"): {"desktop_capture"},
+}
+
+
+def _preview_text(text: str, limit: int = 80) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "..."
+
+
+def _normalize_for_match(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _score_tool_relevance(user_message: str, tool: ToolDefinition) -> int:
+    query = _normalize_for_match(user_message)
+    if not query:
+        return 0
+
+    score = 0
+    corpus_parts = [tool.name, tool.description]
+    corpus_parts.extend(p.name for p in tool.parameters)
+    corpus_parts.extend(p.description for p in tool.parameters)
+    corpus = _normalize_for_match(" ".join(corpus_parts))
+
+    keywords = {w for w in re.findall(r"[\w\u4e00-\u9fff]{2,}", query)}
+    for kw in keywords:
+        if kw and kw in corpus:
+            score += 1
+
+    if (
+        ("图片" in query or "photo" in query or "image" in query)
+        and tool.name in {"browser", "desktop_capture"}
+    ):
+        score += 2
+
+    return score
+
+
+def _select_native_tool_names(registry: ToolRegistry, user_message: str) -> set[str]:
+    defs = registry.list_tools()
+    available = {d.name for d in defs}
+    selected = {name for name in _CORE_NATIVE_TOOLS if name in available}
+    query = _normalize_for_match(user_message)
+
+    for keywords, names in _TOOL_POLICY_KEYWORDS.items():
+        if any(k in query for k in keywords):
+            for name in names:
+                if name in available:
+                    selected.add(name)
+
+    if len(selected) >= _MAX_NATIVE_TOOLS:
+        return selected
+
+    scored: list[tuple[int, str]] = []
+    for d in defs:
+        if d.name in selected:
+            continue
+        scored.append((_score_tool_relevance(user_message, d), d.name))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    for score, name in scored:
+        if score <= 0:
+            break
+        selected.add(name)
+        if len(selected) >= _MAX_NATIVE_TOOLS:
+            break
+
+    return selected
 
 
 def _build_memory_system_message(recalled: str) -> Message:
@@ -629,6 +719,9 @@ async def run_agent(
     session_store: SessionStore | None = None,
     memory_manager: "MemoryManager | None" = None,
     extra_memory: str = "",
+    trigger_event_id: str = "",
+    trigger_text_preview: str = "",
+    group_compressor: "SessionGroupCompressor | None" = None,
 ) -> str:
     """Run the Agent loop with tool support and multi-turn context.
 
@@ -650,14 +743,35 @@ async def run_agent(
         registry = create_default_registry()
 
     native_tools = router.supports_native_tools(model_id)
-
-    tool_schemas = registry.to_llm_schemas() if native_tools else None
+    selected_tool_names: set[str] | None = None
+    if native_tools:
+        selected_tool_names = _select_native_tool_names(registry, message)
+        tool_schemas = registry.to_llm_schemas(include_names=selected_tool_names)
+        all_tool_names = {d.name for d in registry.list_tools()}
+        dropped_names = sorted(all_tool_names - selected_tool_names)
+        log.info(
+            "agent.tools_selected",
+            session_id=session_id,
+            selected=sorted(selected_tool_names),
+            selected_count=len(selected_tool_names),
+            dropped_count=len(dropped_names),
+            dropped=dropped_names,
+        )
+    else:
+        tool_schemas = None
     fallback_text = "" if native_tools else registry.to_prompt_fallback()
 
     system_messages = _assembler.build(
         config, message, tool_fallback_text=fallback_text
     )
+    import time as _time
+
+    _t_pre_llm_start = _time.monotonic()
+    _memory_stage_ms = 0
+    _extra_memory_stage_ms = 0
+    _group_compress_stage_ms = 0
     if memory_manager is not None and agent_cfg.memory.enabled:
+        _t_memory_start = _time.monotonic()
         memory_cfg = agent_cfg.memory
         try:
             style_directive = (
@@ -701,18 +815,24 @@ async def run_agent(
                 log.info("agent.memory_recalled", session_id=session_id, chars=len(recalled))
         except Exception as exc:
             log.debug("agent.memory_recall_failed", error=str(exc), session_id=session_id)
+        _memory_stage_ms = int((_time.monotonic() - _t_memory_start) * 1000)
     if extra_memory.strip():
+        _t_extra_start = _time.monotonic()
         normalized_extra = extra_memory.strip()
         compress_model = summarizer_cfg.model.strip()
         can_compress = bool(compress_model)
-        if can_compress:
+        should_compress_extra = _est_tokens(normalized_extra) > _EVOMAP_MAX_TOKENS
+        if can_compress and should_compress_extra:
             try:
                 router.resolve(compress_model)
-                compressed = await _compress_external_memory_with_llm(
-                    router=router,
-                    model_id=compress_model,
-                    text=normalized_extra,
-                    max_tokens=_EVOMAP_MAX_TOKENS,
+                compressed = await asyncio.wait_for(
+                    _compress_external_memory_with_llm(
+                        router=router,
+                        model_id=compress_model,
+                        text=normalized_extra,
+                        max_tokens=_EVOMAP_MAX_TOKENS,
+                    ),
+                    timeout=_EXTRA_MEMORY_COMPRESS_TIMEOUT_SECONDS,
                 )
                 if compressed:
                     normalized_extra = compressed
@@ -732,13 +852,44 @@ async def run_agent(
                 _EVOMAP_MAX_TOKENS,
             )
         system_messages.append(_build_external_memory_system_message(normalized_extra))
+        _extra_memory_stage_ms = int((_time.monotonic() - _t_extra_start) * 1000)
 
     conversation: list[Message] = []
     if session:
         conversation = list(session.messages)
     conversation.append(Message(role="user", content=message, images=images))
+    conversation_message_count = len(conversation)
+
+    if (
+        group_compressor is not None
+        and session_store is not None
+        and session is not None
+        and summarizer_cfg.model.strip()
+    ):
+        _t_group_start = _time.monotonic()
+        try:
+            conversation = await group_compressor.build_window_messages(
+                session_id=session_id,
+                messages=conversation,
+                router=router,
+                model_id=summarizer_cfg.model.strip(),
+            )
+        except Exception as exc:
+            log.debug("agent.group_compress_failed", session_id=session_id, error=str(exc))
+        _group_compress_stage_ms = int((_time.monotonic() - _t_group_start) * 1000)
+
+    _pre_llm_elapsed_ms = int((_time.monotonic() - _t_pre_llm_start) * 1000)
+    log.debug(
+        "agent.pre_llm_stages",
+        session_id=session_id,
+        memory_ms=_memory_stage_ms,
+        extra_memory_ms=_extra_memory_stage_ms,
+        group_compress_ms=_group_compress_stage_ms,
+        total_ms=_pre_llm_elapsed_ms,
+    )
 
     model_short: str = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+    trigger_preview = trigger_text_preview.strip() or _preview_text(message)
 
     log.info(
         "agent.run",
@@ -746,6 +897,8 @@ async def run_agent(
         session_id=session_id,
         native_tools=native_tools,
         history_messages=len(conversation),
+        trigger_event_id=trigger_event_id,
+        trigger_preview=trigger_preview,
     )
 
     final_text_parts: list[str] = []
@@ -761,11 +914,11 @@ async def run_agent(
             log.debug("agent.summaries_load_failed", error=str(exc))
 
     import hashlib as _hashlib
-    import time as _time
 
     _recent_signatures: list[str] = []
     _loop_detect_window = 3
     invalid_tool_rounds = 0
+    empty_reply_rounds = 0
     browser_fail_streak = 0
     blocked_tools: set[str] = set()
 
@@ -789,10 +942,23 @@ async def run_agent(
             on_stream=on_stream,
         )
         _llm_ms = int((_time.monotonic() - _llm_t0) * 1000)
-        log.info("agent.llm_call", round=round_idx, elapsed_ms=_llm_ms, model=model_id)
-
-        total_input += response.input_tokens
-        total_output += response.output_tokens
+        round_input = response.input_tokens
+        round_output = response.output_tokens
+        total_input += round_input
+        total_output += round_output
+        log.info(
+            "agent.llm_call",
+            round=round_idx,
+            elapsed_ms=_llm_ms,
+            model=model_id,
+            round_input_tokens=round_input,
+            round_output_tokens=round_output,
+            total_input_tokens=total_input,
+            total_output_tokens=total_output,
+            trigger_event_id=trigger_event_id,
+            trigger_preview=trigger_preview,
+            session_id=session_id,
+        )
 
         tool_calls = response.tool_calls
         if not tool_calls and not native_tools and response.content:
@@ -891,12 +1057,38 @@ async def run_agent(
 
         content = response.content or ""
         if content:
+            empty_reply_rounds = 0
             if tool_calls and not native_tools:
                 clean = _strip_tool_json(content)
                 if clean:
                     final_text_parts.append(clean)
             else:
                 final_text_parts.append(content)
+
+        if not tool_calls and not content.strip():
+            empty_reply_rounds += 1
+            log.warning(
+                "agent.empty_response",
+                session_id=session_id,
+                round=round_idx,
+                model=model_id,
+                empty_reply_rounds=empty_reply_rounds,
+            )
+            if empty_reply_rounds == 1:
+                conversation.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "[系统提示] 你上一轮没有输出任何内容。"
+                            "请直接给出简短回复；如果需求不明确，请先问用户要做什么。"
+                        ),
+                    )
+                )
+                continue
+            final_text_parts.append(
+                "我这边没收到模型有效回复。请再发一次需求，我会继续处理。"
+            )
+            break
 
         if not tool_calls:
             break
@@ -1047,7 +1239,8 @@ async def run_agent(
         and router
         and summarizer_cfg.enabled
         and session
-        and _compressor.should_compress(len(conversation))
+        and group_compressor is None
+        and _compressor.should_compress(conversation_message_count)
     ):
         try:
             latest = await session_store.get_latest_summary(session_id, "L0")
@@ -1090,9 +1283,12 @@ async def run_agent(
     log.info(
         "agent.done",
         model=model_id,
+        llm_rounds=max(0, round_idx + 1),
         input_tokens=total_input,
         output_tokens=total_output,
         session_id=session_id,
+        trigger_event_id=trigger_event_id,
+        trigger_preview=trigger_preview,
     )
 
     if session_store and total_input + total_output > 0:

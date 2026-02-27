@@ -85,3 +85,108 @@ async def test_list_sessions(store: SessionStore) -> None:
         )
     rows = await store.list_sessions()
     assert len(rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_group_compression_cache_roundtrip(store: SessionStore) -> None:
+    await store.save_session(
+        session_id="gc1",
+        channel="webchat",
+        peer_id="user1",
+        model="test",
+        created_at="2026-01-01T00:00:00",
+        updated_at="2026-01-01T00:00:00",
+    )
+
+    assert await store.get_group_compression(
+        session_id="gc1",
+        group_idx=4,
+        level="L1",
+        source_hash="hash-a",
+    ) is None
+
+    await store.upsert_group_compression(
+        session_id="gc1",
+        group_idx=4,
+        level="L1",
+        source_hash="hash-a",
+        content="压缩内容 A",
+    )
+
+    assert await store.get_group_compression(
+        session_id="gc1",
+        group_idx=4,
+        level="L1",
+        source_hash="hash-a",
+    ) == "压缩内容 A"
+    assert await store.get_group_compression(
+        session_id="gc1",
+        group_idx=4,
+        level="L1",
+        source_hash="hash-b",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_group_compression_cache_evicts_old_groups_over_300(store: SessionStore) -> None:
+    await store.save_session(
+        session_id="gc2",
+        channel="webchat",
+        peer_id="user2",
+        model="test",
+        created_at="2026-01-01T00:00:00",
+        updated_at="2026-01-01T00:00:00",
+    )
+
+    for i in range(305):
+        await store.upsert_group_compression(
+            session_id="gc2",
+            group_idx=i + 1,
+            level="L1",
+            source_hash=f"hash-{i + 1}",
+            content=f"压缩内容 {i + 1}",
+        )
+        await store.upsert_group_compression(
+            session_id="gc2",
+            group_idx=i + 1,
+            level="L0",
+            source_hash=f"hash0-{i + 1}",
+            content=f"压缩内容0 {i + 1}",
+        )
+
+    cursor = await store._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(DISTINCT group_idx) FROM session_group_compressions WHERE session_id = ?",
+        ("gc2",),
+    )
+    distinct_row = await cursor.fetchone()
+    assert distinct_row is not None
+    assert int(distinct_row[0]) == 300
+
+    # Oldest 5 rows should be evicted.
+    for i in range(1, 6):
+        assert await store.get_group_compression(
+            session_id="gc2",
+            group_idx=i,
+            level="L1",
+            source_hash=f"hash-{i}",
+        ) is None
+        assert await store.get_group_compression(
+            session_id="gc2",
+            group_idx=i,
+            level="L0",
+            source_hash=f"hash0-{i}",
+        ) is None
+
+    # Latest rows should still exist.
+    assert await store.get_group_compression(
+        session_id="gc2",
+        group_idx=305,
+        level="L1",
+        source_hash="hash-305",
+    ) == "压缩内容 305"
+    assert await store.get_group_compression(
+        session_id="gc2",
+        group_idx=305,
+        level="L0",
+        source_hash="hash0-305",
+    ) == "压缩内容0 305"

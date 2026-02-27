@@ -69,6 +69,13 @@ def setup_logging(*, verbose: bool = False) -> None:
     for handler in root.handlers:
         handler.setFormatter(formatter)
 
+    if not verbose:
+        # Reduce noisy transport logs in normal mode.
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("websockets").setLevel(logging.WARNING)
+
 
 def get_logger(name: str | None = None) -> Logger:
     """Return a bound structlog logger."""

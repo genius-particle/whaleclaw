@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import time
@@ -29,6 +30,8 @@ from whaleclaw.memory.vector import SimpleMemoryStore
 from whaleclaw.plugins.hooks import HookManager
 from whaleclaw.plugins.loader import PluginLoader
 from whaleclaw.plugins.registry import PluginRegistry
+from whaleclaw.providers.router import ModelRouter
+from whaleclaw.sessions.group_compressor import SessionGroupCompressor
 from whaleclaw.sessions.manager import SessionManager
 from whaleclaw.sessions.store import SessionStore
 from whaleclaw.tools.registry import ToolRegistry
@@ -89,6 +92,15 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         "registry": None,
         "memory_manager": None,
         "hook_manager": hook_manager,
+        "group_compressor": None,
+        "compression_ready": True,
+        "compression_running": False,
+        "compression_sessions_total": 0,
+        "compression_sessions_done": 0,
+        "compression_groups_total": 0,
+        "compression_groups_done": 0,
+        "compression_cache_hits": 0,
+        "compression_generated": 0,
     }
 
     @asynccontextmanager
@@ -119,6 +131,80 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         await plugin_registry.start_all()
         await cron_scheduler.start()
 
+        summarizer_model = config.agent.summarizer.model.strip()
+        prewarm_task: asyncio.Task[None] | None = None
+        if config.agent.summarizer.enabled and summarizer_model:
+            group_compressor = SessionGroupCompressor(store)
+            state["group_compressor"] = group_compressor
+            state["compression_ready"] = False
+            state["compression_running"] = True
+            state["compression_sessions_total"] = 0
+            state["compression_sessions_done"] = 0
+            state["compression_groups_total"] = 0
+            state["compression_groups_done"] = 0
+            state["compression_cache_hits"] = 0
+            state["compression_generated"] = 0
+
+            async def _prewarm_all_sessions() -> None:
+                router = ModelRouter(config.models)
+                try:
+                    sessions = await manager.list_sessions()
+                    state["compression_sessions_total"] = len(sessions)
+                    log.info("compressor.prewarm_all_start", sessions_total=len(sessions))
+                    for s in sessions:
+                        loaded = await manager.get(s.id)
+                        sessions_done = int(state["compression_sessions_done"])
+                        if not loaded:
+                            state["compression_sessions_done"] = sessions_done + 1
+                            continue
+                        if not loaded.messages:
+                            state["compression_sessions_done"] = sessions_done + 1
+                            continue
+                        stats = await group_compressor.prewarm_session(
+                            session_id=loaded.id,
+                            messages=loaded.messages,
+                            router=router,
+                            model_id=summarizer_model,
+                        )
+                        groups_total = int(state["compression_groups_total"])
+                        groups_done = int(state["compression_groups_done"])
+                        cache_hits = int(state["compression_cache_hits"])
+                        generated = int(state["compression_generated"])
+
+                        state["compression_groups_total"] = (
+                            groups_total + int(stats["total_groups"])
+                        )
+                        state["compression_groups_done"] = (
+                            groups_done + int(stats["processed_groups"])
+                        )
+                        state["compression_cache_hits"] = cache_hits + int(stats["cache_hits"])
+                        state["compression_generated"] = generated + int(stats["generated"])
+                        state["compression_sessions_done"] = sessions_done + 1
+                        log.info(
+                            "compressor.prewarm_session_done",
+                            session_id=loaded.id,
+                            sessions_done=state["compression_sessions_done"],
+                            sessions_total=state["compression_sessions_total"],
+                            groups_done=state["compression_groups_done"],
+                            groups_total=state["compression_groups_total"],
+                            cache_hits=state["compression_cache_hits"],
+                            generated=state["compression_generated"],
+                        )
+                    log.info("compressor.prewarm_done", sessions=len(sessions))
+                except Exception as exc:
+                    log.warning("compressor.prewarm_failed", error=str(exc))
+                finally:
+                    state["compression_running"] = False
+                    state["compression_ready"] = True
+
+            prewarm_task = asyncio.create_task(
+                _prewarm_all_sessions(),
+                name="session-group-prewarm",
+            )
+        else:
+            state["compression_ready"] = True
+            state["compression_running"] = False
+
         nonlocal feishu_channel
         feishu_cfg = config.channels.feishu
         if feishu_cfg.app_id and feishu_cfg.app_secret:
@@ -134,6 +220,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                     registry,
                     memory_manager=memory_manager,
                     hook_manager=hook_manager,
+                    group_compressor=state["group_compressor"],
+                    compression_ready_fn=lambda: bool(state["compression_ready"]),
                 )
 
         _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -147,6 +235,11 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         if feishu_channel is not None:
             await feishu_channel.stop()
+        if prewarm_task is not None and not prewarm_task.done():
+            prewarm_task.cancel()
+        compressor = state["group_compressor"]
+        if isinstance(compressor, SessionGroupCompressor):
+            await compressor.shutdown()
         await cron_scheduler.stop()
         await plugin_registry.stop_all()
         await cron_store.close()
@@ -198,6 +291,16 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return {
             "status": "ok",
             "version": __version__,
+            "compression_ready": bool(state["compression_ready"]),
+            "compression_running": bool(state["compression_running"]),
+            "compression_progress": {
+                "sessions_total": int(state["compression_sessions_total"]),
+                "sessions_done": int(state["compression_sessions_done"]),
+                "groups_total": int(state["compression_groups_total"]),
+                "groups_done": int(state["compression_groups_done"]),
+                "cache_hits": int(state["compression_cache_hits"]),
+                "generated": int(state["compression_generated"]),
+            },
             "gateway": {
                 "port": config.gateway.port,
                 "bind": config.gateway.bind,
@@ -580,6 +683,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             registry=_tool_registry(),
             memory_manager=_memory_manager(),
             hook_manager=_hook_manager(),
+            group_compressor=state["group_compressor"],
+            compression_ready_fn=lambda: bool(state["compression_ready"]),
         )
 
     # ── Static files & SPA fallback ────────────────────────

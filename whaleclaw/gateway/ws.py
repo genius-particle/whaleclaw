@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -18,6 +19,7 @@ from whaleclaw.gateway.protocol import (
     make_error,
     make_message,
     make_pong,
+    make_status,
     make_stream,
     make_tool_call,
     make_tool_result,
@@ -33,6 +35,7 @@ from whaleclaw.utils.log import get_logger
 
 if TYPE_CHECKING:
     from whaleclaw.memory.manager import MemoryManager
+    from whaleclaw.sessions.group_compressor import SessionGroupCompressor
 
 log = get_logger(__name__)
 
@@ -96,6 +99,8 @@ async def websocket_handler(
     registry: ToolRegistry,
     memory_manager: MemoryManager | None = None,
     hook_manager: HookManager | None = None,
+    group_compressor: SessionGroupCompressor | None = None,
+    compression_ready_fn: Callable[[], bool] | None = None,
 ) -> None:
     """Handle a single WebSocket connection lifecycle."""
     await websocket.accept()
@@ -119,7 +124,7 @@ async def websocket_handler(
     ws_alive = True
     inbox: asyncio.Queue[WSMessage] = asyncio.Queue()
 
-    log.info("ws.connected", conn_key=conn_key)
+    log.debug("ws.connected", conn_key=conn_key)
 
     async def _reader() -> None:
         """Read WS messages and dispatch: ping handled inline, others queued."""
@@ -127,27 +132,43 @@ async def websocket_handler(
         try:
             while ws_alive:
                 raw = await websocket.receive_text()
+                log.debug("ws.recv_raw", size=len(raw), preview=raw[:120])
                 try:
                     incoming = WSMessage.model_validate_json(raw)
                 except Exception:
                     sid = session.id if session else ""
+                    log.warning("ws.invalid_message_json", preview=raw[:200], session_id=sid)
                     await _safe_send(websocket, make_error(sid, "无效的消息格式"))
                     continue
-
                 if incoming.type == MessageType.PING:
+                    log.debug("ws.ping", session_id=incoming.session_id)
                     await _safe_send(websocket, make_pong())
                     continue
 
+                log.debug(
+                    "ws.incoming",
+                    type=incoming.type,
+                    session_id=incoming.session_id,
+                    payload_keys=list(incoming.payload.keys()),
+                )
+
                 if incoming.type == MessageType.MESSAGE:
+                    content = str(incoming.payload.get("content", ""))
+                    log.info(
+                        "ws.message_enqueued",
+                        session_id=incoming.session_id,
+                        content_len=len(content),
+                        content_preview=(" ".join(content.split())[:80]),
+                    )
                     await inbox.put(incoming)
         except WebSocketDisconnect:
             ws_alive = False
             sid = session.id if session else "(none)"
-            log.info("ws.disconnected", session_id=sid)
+            log.debug("ws.disconnected", session_id=sid)
         except Exception:
             ws_alive = False
             sid = session.id if session else "(none)"
-            log.info("ws.closed_unexpectedly", session_id=sid)
+            log.debug("ws.closed_unexpectedly", session_id=sid)
 
     async def _processor() -> None:
         """Process queued user messages (run agent, send replies)."""
@@ -163,8 +184,22 @@ async def websocket_handler(
             )
             _active_connections[session.id] = websocket
 
+            if compression_ready_fn is not None and not compression_ready_fn():
+                await _safe_send(
+                    websocket,
+                    make_status(session.id, "会话压缩中，请稍后再试…"),
+                )
+                continue
+
             content = incoming.payload.get("content", "")
             raw_images = incoming.payload.get("images", [])
+            log.debug(
+                "ws.message_processing",
+                session_id=session.id,
+                incoming_session_id=incoming.session_id,
+                content_len=len(content) if isinstance(content, str) else 0,
+                images_count=len(raw_images) if isinstance(raw_images, list) else 0,
+            )
 
             images: list[ImageContent] = []
             if isinstance(raw_images, list):
@@ -180,7 +215,7 @@ async def websocket_handler(
                 continue
 
             if images:
-                log.info("ws.images", count=len(images), session_id=session.id)
+                log.debug("ws.images", count=len(images), session_id=session.id)
 
             cmd_result = await chat_cmd.handle(content, session) if content else None
             if cmd_result is not None:
@@ -254,6 +289,9 @@ async def websocket_handler(
                     session_store=_store,
                     memory_manager=memory_manager,
                     extra_memory=extra_memory,
+                    trigger_event_id=incoming.id,
+                    trigger_text_preview=content or "(用户发送了图片)",
+                    group_compressor=group_compressor,
                 )
                 await session_manager.add_message(session, "assistant", reply)
                 await _safe_send(websocket, make_message(session.id, reply))

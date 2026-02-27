@@ -14,6 +14,7 @@ from whaleclaw.utils.log import get_logger
 log = get_logger(__name__)
 
 _DB_PATH = SESSIONS_DIR / "sessions.db"
+_GROUP_COMPRESSION_MAX_GROUPS = 300
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -66,6 +67,21 @@ CREATE TABLE IF NOT EXISTS token_usage (
 
 CREATE INDEX IF NOT EXISTS idx_token_usage_session
     ON token_usage(session_id);
+
+CREATE TABLE IF NOT EXISTS session_group_compressions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    group_idx INTEGER NOT NULL,
+    level TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(session_id, group_idx, level)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_compress_session
+    ON session_group_compressions(session_id, group_idx, level);
 """
 
 
@@ -400,7 +416,9 @@ class SessionStore:
             (session_id,),
         )
         row = await cursor.fetchone()
-        return {"input_tokens": row[0], "output_tokens": row[1]} if row else {"input_tokens": 0, "output_tokens": 0}
+        if row:
+            return {"input_tokens": row[0], "output_tokens": row[1]}
+        return {"input_tokens": 0, "output_tokens": 0}
 
     async def get_total_token_usage(self) -> dict[str, int]:
         """Return global {input_tokens, output_tokens} totals."""
@@ -409,7 +427,9 @@ class SessionStore:
             " FROM token_usage"
         )
         row = await cursor.fetchone()
-        return {"input_tokens": row[0], "output_tokens": row[1]} if row else {"input_tokens": 0, "output_tokens": 0}
+        if row:
+            return {"input_tokens": row[0], "output_tokens": row[1]}
+        return {"input_tokens": 0, "output_tokens": 0}
 
     async def get_token_usage_by_model(self) -> list[dict[str, object]]:
         """Return token usage grouped by model."""
@@ -421,3 +441,63 @@ class SessionStore:
             {"model": r[0], "input_tokens": r[1], "output_tokens": r[2], "calls": r[3]}
             for r in await cursor.fetchall()
         ]
+
+    # ── Group compression cache ──
+
+    async def get_group_compression(
+        self,
+        *,
+        session_id: str,
+        group_idx: int,
+        level: str,
+        source_hash: str,
+    ) -> str | None:
+        cursor = await self._conn.execute(
+            "SELECT content, source_hash FROM session_group_compressions"
+            " WHERE session_id = ? AND group_idx = ? AND level = ? LIMIT 1",
+            (session_id, group_idx, level),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        if row[1] != source_hash:
+            return None
+        return str(row[0])
+
+    async def upsert_group_compression(
+        self,
+        *,
+        session_id: str,
+        group_idx: int,
+        level: str,
+        source_hash: str,
+        content: str,
+    ) -> None:
+        now = datetime.now().isoformat()
+        await self._conn.execute(
+            """INSERT INTO session_group_compressions
+               (session_id, group_idx, level, source_hash, content, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, group_idx, level)
+               DO UPDATE SET source_hash=excluded.source_hash,
+                             content=excluded.content,
+                             updated_at=excluded.updated_at
+            """,
+            (session_id, group_idx, level, source_hash, content, now, now),
+        )
+        # Keep only latest N groups per session; evict oldest group indexes first.
+        await self._conn.execute(
+            """DELETE FROM session_group_compressions
+               WHERE session_id = ?
+                 AND group_idx IN (
+                     SELECT group_idx FROM (
+                         SELECT DISTINCT group_idx
+                         FROM session_group_compressions
+                         WHERE session_id = ?
+                         ORDER BY group_idx DESC
+                         LIMIT -1 OFFSET ?
+                     )
+               )""",
+            (session_id, session_id, _GROUP_COMPRESSION_MAX_GROUPS),
+        )
+        await self._conn.commit()
