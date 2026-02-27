@@ -108,5 +108,5 @@ WhaleClaw 不是对 OpenClaw 的否定，而是针对“长期运行成本与本
 }
 
 
-windos版 链接：https://pan.quark.cn/s/9f5bcd0d854e
-mac版 链接：https://pan.quark.cn/s/27b9b18c7125
+翘脚党请直接下载一键包使用：
+链接：https://pan.quark.cn/s/acdffa9adc21 内含windos和MAC的！！！
