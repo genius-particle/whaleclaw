@@ -130,54 +130,57 @@ def _default_multi_agent_config() -> dict[str, object]:
     }
 
 
-def _normalize_multi_agent_config(raw: object) -> dict[str, object]:
+def _normalize_multi_agent_config(raw: dict[str, Any] | Any) -> dict[str, Any]:
     defaults = _default_multi_agent_config()
     if not isinstance(raw, dict):
         return defaults
 
-    mode_raw = str(raw.get("mode", defaults["mode"])).strip().lower()
+    d: dict[str, Any] = raw
+
+    mode_raw = str(d.get("mode", defaults["mode"])).strip().lower()
     mode = mode_raw if mode_raw in _MULTI_AGENT_MODES else str(defaults["mode"])
 
-    scenario_raw = str(raw.get("scenario", defaults["scenario"])).strip()
+    scenario_raw = str(d.get("scenario", defaults["scenario"])).strip()
     scenario = scenario_raw
     if scenario not in _MULTI_AGENT_SCENARIOS and not scenario.startswith("custom::"):
         scenario = str(defaults["scenario"])
 
-    custom_scenarios_raw = raw.get("custom_scenarios")
+    custom_scenarios_raw = d.get("custom_scenarios")
     custom_scenarios: list[str] = []
     if isinstance(custom_scenarios_raw, list):
         for item in custom_scenarios_raw[:20]:
-            name = str(item).strip()
-            if not name or name in custom_scenarios:
+            cname = str(item).strip()
+            if not cname or cname in custom_scenarios:
                 continue
-            custom_scenarios.append(name[:40])
+            custom_scenarios.append(cname[:40])
 
-    max_rounds_raw = raw.get("max_rounds", defaults["max_rounds"])
+    max_rounds_raw = d.get("max_rounds", defaults["max_rounds"])
     try:
         max_rounds = int(max_rounds_raw)
     except Exception:
         max_rounds = int(defaults["max_rounds"])
     max_rounds = max(1, min(max_rounds, 10))
 
-    roles_raw = raw.get("roles")
-    roles: list[dict[str, object]] = []
+    roles_raw = d.get("roles")
+    roles: list[dict[str, Any]] = []
     if isinstance(roles_raw, list):
         for idx, item in enumerate(roles_raw[:20], start=1):
             if not isinstance(item, dict):
                 continue
-            rid = str(item.get("id", f"role_{idx}")).strip().lower()
+            ritem: dict[str, Any] = item
+            rid = str(ritem.get("id", f"role_{idx}")).strip().lower()
             rid = "".join(ch for ch in rid if ch.isalnum() or ch in {"_", "-"})
             if not rid:
                 rid = f"role_{idx}"
-            name = str(item.get("name", f"角色{idx}")).strip() or f"角色{idx}"
-            model = str(item.get("model", "")).strip()
-            prompt = str(item.get("system_prompt", "")).strip()
+            rname = str(ritem.get("name", f"角色{idx}")).strip() or f"角色{idx}"
+            rmodel = str(ritem.get("model", "")).strip()
+            prompt = str(ritem.get("system_prompt", "")).strip()
             roles.append(
                 {
                     "id": rid[:64],
-                    "name": name[:50],
-                    "enabled": bool(item.get("enabled", True)),
-                    "model": model[:100],
+                    "name": rname[:50],
+                    "enabled": bool(ritem.get("enabled", True)),
+                    "model": rmodel[:100],
                     "system_prompt": prompt[:3000],
                 }
             )
@@ -185,7 +188,7 @@ def _normalize_multi_agent_config(raw: object) -> dict[str, object]:
         roles = _default_multi_agent_roles()
 
     return {
-        "enabled": bool(raw.get("enabled", defaults["enabled"])),
+        "enabled": bool(d.get("enabled", defaults["enabled"])),
         "scenario": scenario,
         "custom_scenarios": custom_scenarios,
         "mode": mode,
@@ -196,19 +199,19 @@ def _normalize_multi_agent_config(raw: object) -> dict[str, object]:
 
 def _is_multi_agent_effective_for_metadata(
     config: WhaleclawConfig,
-    metadata: object,
+    metadata: Any,
 ) -> bool:
     global_enabled = False
-    if isinstance(config.plugins, dict):
-        raw = config.plugins.get("multi_agent", {})
-        if isinstance(raw, dict):
-            global_enabled = bool(raw.get("enabled", False))
+    plugins_cfg = config.plugins if isinstance(config.plugins, dict) else {}
+    ma_raw = plugins_cfg.get("multi_agent", {}) if isinstance(plugins_cfg, dict) else {}
+    if isinstance(ma_raw, dict):
+        global_enabled = bool(ma_raw.get("enabled", False))
     if isinstance(metadata, dict) and isinstance(metadata.get("multi_agent_enabled"), bool):
         return bool(metadata["multi_agent_enabled"])
     return global_enabled
 
 
-def _read_json_config(path: Path) -> dict[str, object]:
+def _read_json_config(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     try:
@@ -217,10 +220,10 @@ def _read_json_config(path: Path) -> dict[str, object]:
         return {}
     if not isinstance(raw, dict):
         return {}
-    return raw
+    return raw  # type: ignore[return-value]
 
 
-def _write_json_config(path: Path, data: dict[str, object]) -> None:
+def _write_json_config(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
@@ -272,7 +275,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
     feishu_channel: Any = None
 
-    state: dict[str, object] = {
+    state: dict[str, Any] = {
         "manager": None,
         "registry": None,
         "memory_manager": None,
@@ -479,11 +482,13 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     # ── Health ──────────────────────────────────────────────
 
     @app.get("/api/status")
-    async def status() -> dict[str, object]:
-        plugins_cfg = config.plugins if isinstance(config.plugins, dict) else {}
-        evomap_cfg = plugins_cfg.get("evomap", {})
+    async def _api_status() -> dict[str, Any]:
+        plugins_cfg: dict[str, Any] = (
+            config.plugins if isinstance(config.plugins, dict) else {}
+        )
+        evomap_raw = plugins_cfg.get("evomap", {})
         evomap_enabled = (
-            bool(evomap_cfg.get("enabled", False)) if isinstance(evomap_cfg, dict) else False
+            bool(evomap_raw.get("enabled", False)) if isinstance(evomap_raw, dict) else False
         )
         return {
             "status": "ok",
@@ -491,12 +496,12 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             "compression_ready": bool(state["compression_ready"]),
             "compression_running": bool(state["compression_running"]),
             "compression_progress": {
-                "sessions_total": int(state["compression_sessions_total"]),
-                "sessions_done": int(state["compression_sessions_done"]),
-                "groups_total": int(state["compression_groups_total"]),
-                "groups_done": int(state["compression_groups_done"]),
-                "cache_hits": int(state["compression_cache_hits"]),
-                "generated": int(state["compression_generated"]),
+                "sessions_total": state["compression_sessions_total"],
+                "sessions_done": state["compression_sessions_done"],
+                "groups_total": state["compression_groups_total"],
+                "groups_done": state["compression_groups_done"],
+                "cache_hits": state["compression_cache_hits"],
+                "generated": state["compression_generated"],
             },
             "gateway": {
                 "port": config.gateway.port,
@@ -512,7 +517,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     # ── Models ───────────────────────────────────────────────
 
     @app.get("/api/models")
-    async def list_models() -> dict[str, object]:
+    async def _api_list_models() -> dict[str, Any]:
         """Return all verified configured models grouped by provider.
 
         Each provider reads from ``configured_models`` (persisted via the
@@ -571,7 +576,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     # ── Auth ────────────────────────────────────────────────
 
     @app.post("/api/auth/login")
-    async def auth_login(body: dict[str, str]) -> JSONResponse:
+    async def _api_auth_login(body: dict[str, str]) -> JSONResponse:
         if config.gateway.auth.mode != "password":
             return JSONResponse(
                 {"error": "当前认证模式不支持密码登录"},
@@ -583,16 +588,16 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return JSONResponse({"token": token})
 
     @app.get("/api/auth/verify")
-    async def auth_verify() -> JSONResponse:
+    async def _api_auth_verify() -> JSONResponse:
         return JSONResponse({"valid": True})
 
     # ── Sessions REST ───────────────────────────────────────
 
     @app.get("/api/sessions")
-    async def list_sessions() -> list[dict[str, object]]:
+    async def _api_list_sessions() -> list[dict[str, Any]]:
         mgr = _mgr()
         sessions = await mgr.list_sessions()
-        result = []
+        result: list[dict[str, Any]] = []
         for s in sessions:
             usage = await store.get_session_token_usage(s.id)
             result.append(
@@ -611,7 +616,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return result
 
     @app.post("/api/sessions")
-    async def create_session() -> dict[str, object]:
+    async def _api_create_session() -> dict[str, Any]:
         mgr = _mgr()
         session = await mgr.create("webchat", "web-user")
         return {
@@ -621,7 +626,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         }
 
     @app.get("/api/sessions/{session_id}")
-    async def get_session(session_id: str) -> JSONResponse:
+    async def _api_get_session(session_id: str) -> JSONResponse:
         mgr = _mgr()
         session = await mgr.get(session_id)
         if not session:
@@ -639,17 +644,17 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.delete("/api/sessions/{session_id}")
-    async def delete_session(session_id: str) -> JSONResponse:
+    async def _api_delete_session(session_id: str) -> JSONResponse:
         mgr = _mgr()
         await mgr.delete(session_id)
         return JSONResponse({"ok": True})
 
     @app.post("/api/sessions/{session_id}/compact")
-    async def compact_session(session_id: str) -> JSONResponse:
+    async def _api_compact_session(session_id: str) -> JSONResponse:
         return JSONResponse({"message": "上下文压缩功能将在后续版本实现"})
 
     @app.get("/api/token-usage")
-    async def get_total_token_usage() -> JSONResponse:
+    async def _api_get_total_token_usage() -> JSONResponse:
         total = await store.get_total_token_usage()
         by_model = await store.get_token_usage_by_model()
         return JSONResponse(
@@ -660,7 +665,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.get("/api/sessions/{session_id}/token-usage")
-    async def get_session_token_usage(session_id: str) -> JSONResponse:
+    async def _api_get_session_token_usage(session_id: str) -> JSONResponse:
         usage = await store.get_session_token_usage(session_id)
         return JSONResponse(usage)
 
@@ -677,7 +682,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return _skill_manager
 
     @app.get("/api/skills")
-    async def list_skills() -> list[dict[str, object]]:
+    async def _api_list_skills() -> list[dict[str, Any]]:
         mgr = _get_skill_manager()
         bundled = mgr.discover()
         installed_ids = {s.id for s in mgr.list_installed()}
@@ -697,7 +702,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return result
 
     @app.post("/api/skills/install")
-    async def install_skill(body: dict[str, str]) -> JSONResponse:
+    async def _api_install_skill(body: dict[str, str]) -> JSONResponse:
         source = body.get("source", "").strip()
         if not source:
             return JSONResponse({"error": "缺少 source 参数"}, status_code=400)
@@ -714,7 +719,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
     @app.get("/api/skills/{skill_id}", response_model=None)
-    async def get_skill_detail(skill_id: str):
+    async def _api_get_skill_detail(skill_id: str):  # noqa: ANN201
         mgr = _get_skill_manager()
         all_skills = mgr.discover()
         skill = next((s for s in all_skills if s.id == skill_id), None)
@@ -736,7 +741,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         }
 
     @app.get("/api/skills/{skill_id}/raw")
-    async def get_skill_detail_raw(skill_id: str) -> JSONResponse:
+    async def _api_get_skill_detail_raw(skill_id: str) -> JSONResponse:
         mgr = _get_skill_manager()
         all_skills = mgr.discover()
         skill = next((s for s in all_skills if s.id == skill_id), None)
@@ -749,7 +754,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return JSONResponse({"id": skill.id, "name": skill.name, "raw_markdown": raw_content})
 
     @app.delete("/api/skills/{skill_id}")
-    async def uninstall_skill(skill_id: str) -> JSONResponse:
+    async def _api_uninstall_skill(skill_id: str) -> JSONResponse:
         mgr = _get_skill_manager()
         removed = mgr.uninstall(skill_id)
         if not removed:
@@ -758,8 +763,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
     # ── ClawHub REST ───────────────────────────────────────
 
-    def _read_clawhub_cfg() -> dict[str, object]:
-        plugins_cfg = config.plugins if isinstance(config.plugins, dict) else {}
+    def _read_clawhub_cfg() -> dict[str, Any]:
+        plugins_cfg: dict[str, Any] = config.plugins if isinstance(config.plugins, dict) else {}
         clawhub_cfg = plugins_cfg.get("clawhub", {})
         if not isinstance(clawhub_cfg, dict):
             clawhub_cfg = {}
@@ -775,7 +780,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         }
 
     @app.get("/api/plugins/clawhub")
-    async def get_clawhub_config() -> JSONResponse:
+    async def _api_get_clawhub_config() -> JSONResponse:
         cfg = _read_clawhub_cfg()
         cli = get_clawhub_cli_status()
         return JSONResponse(
@@ -790,7 +795,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.post("/api/plugins/clawhub")
-    async def set_clawhub_config(body: dict[str, object]) -> JSONResponse:
+    async def _api_set_clawhub_config(body: dict[str, Any]) -> JSONResponse:
         enabled = bool(body.get("enabled", False))
         registry_url = str(body.get("registry_url", "https://clawhub.ai")).strip()
         if not registry_url:
@@ -799,8 +804,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         if not isinstance(config.plugins, dict):
             config.plugins = {}
-        raw = config.plugins.get("clawhub", {})
-        current_cfg = raw if isinstance(raw, dict) else {}
+        raw_ch: Any = config.plugins.get("clawhub", {})
+        current_cfg: dict[str, Any] = raw_ch if isinstance(raw_ch, dict) else {}
         current_cfg["enabled"] = enabled
         current_cfg["registry_url"] = registry_url
         if api_token:
@@ -810,11 +815,11 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         config.plugins["clawhub"] = current_cfg
 
         user_cfg = _read_json_config(CONFIG_FILE)
-        plugins_cfg = user_cfg.get("plugins")
+        plugins_cfg: dict[str, Any] = user_cfg.get("plugins", {})
         if not isinstance(plugins_cfg, dict):
             plugins_cfg = {}
             user_cfg["plugins"] = plugins_cfg
-        user_clawhub = plugins_cfg.get("clawhub")
+        user_clawhub: Any = plugins_cfg.get("clawhub")
         if not isinstance(user_clawhub, dict):
             user_clawhub = {}
             plugins_cfg["clawhub"] = user_clawhub
@@ -845,7 +850,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.post("/api/clawhub/install-cli")
-    async def clawhub_install_cli_api() -> JSONResponse:
+    async def _api_clawhub_install_cli() -> JSONResponse:
         try:
             info = install_clawhub_cli()
         except ClawHubCliError as exc:
@@ -863,7 +868,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.get("/api/clawhub/auth-status")
-    async def clawhub_auth_status() -> JSONResponse:
+    async def _api_clawhub_auth_status() -> JSONResponse:
         cfg = _read_clawhub_cfg()
         status = get_clawhub_auth_status(
             registry_url=str(cfg["registry_url"]),
@@ -878,7 +883,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.post("/api/clawhub/login")
-    async def clawhub_login() -> JSONResponse:
+    async def _api_clawhub_login() -> JSONResponse:
         cfg = _read_clawhub_cfg()
         try:
             result = login_clawhub_cli(
@@ -899,7 +904,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.post("/api/clawhub/logout")
-    async def clawhub_logout() -> JSONResponse:
+    async def _api_clawhub_logout() -> JSONResponse:
         cfg = _read_clawhub_cfg()
         try:
             result = logout_clawhub_cli(
@@ -920,7 +925,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.get("/api/clawhub/search")
-    async def clawhub_search(q: str = "", limit: int = 24) -> JSONResponse:
+    async def _api_clawhub_search(q: str = "", limit: int = 24) -> JSONResponse:
         query = q.strip()
         if not query:
             return JSONResponse({"error": "缺少查询参数 q"}, status_code=400)
@@ -943,7 +948,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return JSONResponse({"items": items[:limit]})
 
     @app.post("/api/clawhub/install")
-    async def clawhub_install(body: dict[str, object]) -> JSONResponse:
+    async def _api_clawhub_install(body: dict[str, Any]) -> JSONResponse:
         slug = str(body.get("slug", "")).strip()
         if not slug:
             return JSONResponse({"error": "缺少 slug 参数"}, status_code=400)
@@ -1002,7 +1007,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.post("/api/clawhub/publish-installed")
-    async def clawhub_publish_installed(body: dict[str, object]) -> JSONResponse:
+    async def _api_clawhub_publish_installed(body: dict[str, Any]) -> JSONResponse:
         skill_id = str(body.get("skill_id", "")).strip()
         if not skill_id:
             return JSONResponse({"error": "缺少 skill_id 参数"}, status_code=400)
@@ -1058,13 +1063,15 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     # ── Tools REST ────────────────────────────────────────
 
     @app.get("/api/tools")
-    async def list_tools() -> list[dict[str, object]]:
+    async def _api_list_tools() -> list[dict[str, Any]]:
         reg = _tool_registry()
         tools = reg.list_tools()
-        plugins_cfg = config.plugins if isinstance(config.plugins, dict) else {}
-        evomap_cfg = plugins_cfg.get("evomap", {})
+        plugins_cfg: dict[str, Any] = (
+            config.plugins if isinstance(config.plugins, dict) else {}
+        )
+        evomap_raw = plugins_cfg.get("evomap", {})
         evomap_enabled = (
-            bool(evomap_cfg.get("enabled", False)) if isinstance(evomap_cfg, dict) else False
+            bool(evomap_raw.get("enabled", False)) if isinstance(evomap_raw, dict) else False
         )
         if not evomap_enabled:
             tools = [t for t in tools if not t.name.startswith("evomap_")]
@@ -1104,14 +1111,16 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     # ── Plugins REST ──────────────────────────────────────
 
     @app.get("/api/plugins/multi-agent")
-    async def get_multi_agent_config() -> JSONResponse:
-        plugins_cfg = config.plugins if isinstance(config.plugins, dict) else {}
+    async def _api_get_multi_agent_config() -> JSONResponse:
+        plugins_cfg: dict[str, Any] = (
+            config.plugins if isinstance(config.plugins, dict) else {}
+        )
         raw = plugins_cfg.get("multi_agent", {})
         current = _normalize_multi_agent_config(raw)
         return JSONResponse(current)
 
     @app.post("/api/plugins/multi-agent")
-    async def set_multi_agent_config(body: dict[str, object]) -> JSONResponse:
+    async def _api_set_multi_agent_config(body: dict[str, Any]) -> JSONResponse:
         current = _normalize_multi_agent_config(body)
 
         if not isinstance(config.plugins, dict):
@@ -1119,11 +1128,11 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         config.plugins["multi_agent"] = current
 
         user_cfg = _read_json_config(CONFIG_FILE)
-        plugins_cfg = user_cfg.get("plugins")
-        if not isinstance(plugins_cfg, dict):
-            plugins_cfg = {}
-            user_cfg["plugins"] = plugins_cfg
-        plugins_cfg["multi_agent"] = current
+        uc_plugins: dict[str, Any] = user_cfg.get("plugins", {})
+        if not isinstance(uc_plugins, dict):
+            uc_plugins = {}
+            user_cfg["plugins"] = uc_plugins
+        uc_plugins["multi_agent"] = current
 
         try:
             _write_json_config(CONFIG_FILE, user_cfg)
@@ -1142,14 +1151,16 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.get("/api/plugins/evomap")
-    async def get_evomap_config() -> JSONResponse:
-        plugins_cfg = config.plugins if isinstance(config.plugins, dict) else {}
-        evomap_cfg = plugins_cfg.get("evomap", {})
-        enabled = bool(evomap_cfg.get("enabled", False)) if isinstance(evomap_cfg, dict) else False
+    async def _api_get_evomap_config() -> JSONResponse:
+        plugins_cfg: dict[str, Any] = (
+            config.plugins if isinstance(config.plugins, dict) else {}
+        )
+        evomap_raw = plugins_cfg.get("evomap", {})
+        enabled = bool(evomap_raw.get("enabled", False)) if isinstance(evomap_raw, dict) else False
         return JSONResponse({"enabled": enabled})
 
     @app.post("/api/plugins/evomap")
-    async def set_evomap_config(body: dict[str, object]) -> JSONResponse:
+    async def _api_set_evomap_config(body: dict[str, Any]) -> JSONResponse:
         if "enabled" not in body:
             return JSONResponse({"error": "缺少 enabled 参数"}, status_code=400)
         enabled = bool(body.get("enabled", False))
@@ -1163,15 +1174,15 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         config.plugins["evomap"] = current_cfg
 
         user_cfg = _read_json_config(CONFIG_FILE)
-        plugins_cfg = user_cfg.get("plugins")
-        if not isinstance(plugins_cfg, dict):
-            plugins_cfg = {}
-            user_cfg["plugins"] = plugins_cfg
-        evomap_cfg = plugins_cfg.get("evomap")
-        if not isinstance(evomap_cfg, dict):
-            evomap_cfg = {}
-            plugins_cfg["evomap"] = evomap_cfg
-        evomap_cfg["enabled"] = enabled
+        uc_plugins_ev: dict[str, Any] = user_cfg.get("plugins", {})
+        if not isinstance(uc_plugins_ev, dict):
+            uc_plugins_ev = {}
+            user_cfg["plugins"] = uc_plugins_ev
+        uc_evomap: Any = uc_plugins_ev.get("evomap")
+        if not isinstance(uc_evomap, dict):
+            uc_evomap = {}
+            uc_plugins_ev["evomap"] = uc_evomap
+        uc_evomap["enabled"] = enabled
         try:
             _write_json_config(CONFIG_FILE, user_cfg)
         except Exception as exc:
@@ -1180,12 +1191,29 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 status_code=500,
             )
 
+        reg = _tool_registry()
+        has_evomap_tools = any(t.name.startswith("evomap_") for t in reg.list_tools())
+
+        if enabled and not has_evomap_tools:
+            try:
+                await _register_evomap_plugin_dynamically(
+                    config, reg, plugin_registry, hook_manager,
+                )
+            except Exception as exc:
+                log.warning("evomap.dynamic_register_failed", error=str(exc))
+
+        if not enabled and has_evomap_tools:
+            _unregister_evomap_tools(reg)
+            existing = plugin_registry.get("evomap")
+            if existing:
+                await plugin_registry.unregister("evomap")
+
         return JSONResponse({"ok": True, "enabled": enabled, "persisted_to": str(CONFIG_FILE)})
 
     # ── Memory Style REST ─────────────────────────────────
 
     @app.get("/api/memory/style")
-    async def get_memory_style() -> JSONResponse:
+    async def _api_get_memory_style() -> JSONResponse:
         mgr = _memory_manager()
         style = await mgr.get_global_style_directive()
         return JSONResponse(
@@ -1197,7 +1225,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.post("/api/memory/style")
-    async def set_memory_style(body: dict[str, str]) -> JSONResponse:
+    async def _api_set_memory_style(body: dict[str, str]) -> JSONResponse:
         directive = str(body.get("style_directive", "")).strip()
         if not directive:
             return JSONResponse({"error": "style_directive 不能为空"}, status_code=400)
@@ -1211,7 +1239,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return JSONResponse({"ok": True, "changed": changed})
 
     @app.delete("/api/memory/style")
-    async def clear_memory_style() -> JSONResponse:
+    async def _api_clear_memory_style() -> JSONResponse:
         mgr = _memory_manager()
         removed = await mgr.clear_global_style_directive()
         return JSONResponse({"ok": True, "removed": removed})
@@ -1219,7 +1247,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     # ── File upload ─────────────────────────────────────────
 
     @app.post("/api/upload")
-    async def upload_file(file: UploadFile) -> JSONResponse:
+    async def _api_upload_file(file: UploadFile) -> JSONResponse:
         if not file.filename:
             return JSONResponse({"error": "文件名为空"}, status_code=400)
         dest = _UPLOAD_DIR / file.filename
@@ -1234,7 +1262,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
 
     @app.get("/api/files/{filename}", response_model=None)
-    async def get_file(filename: str) -> FileResponse | JSONResponse:
+    async def _api_get_file(filename: str) -> FileResponse | JSONResponse:
         path = _UPLOAD_DIR / filename
         if not path.is_file():
             return JSONResponse({"error": "文件不存在"}, status_code=404)
@@ -1258,7 +1286,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return None
 
     @app.get("/api/local-file", response_model=None)
-    async def get_local_file(
+    async def _api_get_local_file(
         path: str,
         download: bool = False,
     ) -> FileResponse | JSONResponse:
@@ -1276,7 +1304,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return FileResponse(fp, filename=fp.name)
 
     @app.get("/api/file-info")
-    async def file_info(path: str) -> JSONResponse:
+    async def _api_file_info(path: str) -> JSONResponse:
         """Return metadata about a local file (name, size)."""
         fp = _resolve_local_path(path)
         if not fp:
@@ -1300,7 +1328,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     # ── WebSocket ───────────────────────────────────────────
 
     @app.websocket("/ws")
-    async def ws_endpoint(websocket: WebSocket) -> None:
+    async def _api_ws_endpoint(websocket: WebSocket) -> None:
+        gc = state["group_compressor"]
         await websocket_handler(
             websocket,
             config,
@@ -1308,7 +1337,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             registry=_tool_registry(),
             memory_manager=_memory_manager(),
             hook_manager=_hook_manager(),
-            group_compressor=state["group_compressor"],
+            group_compressor=gc if isinstance(gc, SessionGroupCompressor) else None,
             compression_ready_fn=lambda: bool(state["compression_ready"]),
         )
 
@@ -1325,7 +1354,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         _boot_ts = str(int(time.time()))
 
         @app.get("/")
-        async def index() -> HTMLResponse:
+        async def _index() -> HTMLResponse:
             html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
             v = f"{__version__}.{_boot_ts}"
             html = html.replace("/assets/app.css", f"/assets/app.css?v={v}")
@@ -1335,7 +1364,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     else:
 
         @app.get("/")
-        async def health() -> dict[str, str]:
+        async def _health() -> dict[str, str]:
             return {"status": "ok", "version": __version__}
 
     return app
@@ -1355,23 +1384,20 @@ async def _load_plugins(
     if not metas:
         return
 
+    def _plugin_cfg(pid: str) -> dict[str, Any]:
+        raw = getattr(config, "plugins", {})
+        if isinstance(raw, dict):
+            val = raw.get(pid, {})
+            return val if isinstance(val, dict) else {}
+        return {}
+
     for meta in metas:
         try:
             plugin = loader.load(meta.id)
 
-            def _make_config_fn(pid: str) -> object:
-                plugins_cfg = getattr(config, "plugins", {})
-                if isinstance(plugins_cfg, dict):
-                    return plugins_cfg.get(pid, {})
-                return {}
-
             api = WhaleclawPluginApi(
                 plugin_id=meta.id,
-                get_config_fn=lambda pid, key, default: (
-                    _make_config_fn(pid).get(key, default)  # type: ignore[union-attr]
-                    if isinstance(_make_config_fn(pid), dict)
-                    else default
-                ),
+                get_config_fn=lambda pid, key, default: _plugin_cfg(pid).get(key, default),
                 get_secret_fn=lambda pid, key: None,
                 channel_register_fn=lambda ch: None,
                 tool_register_fn=lambda t: tool_registry.register(t),
@@ -1388,3 +1414,61 @@ async def _load_plugins(
                 plugin_id=meta.id,
                 error=str(exc),
             )
+
+
+async def _register_evomap_plugin_dynamically(
+    config: WhaleclawConfig,
+    tool_registry: ToolRegistry,
+    plugin_registry: PluginRegistry,
+    hook_manager: HookManager,
+) -> None:
+    """Register EvoMap plugin tools at runtime when the toggle is switched on."""
+    from whaleclaw.plugins.evomap.plugin import EvoMapPlugin
+    from whaleclaw.plugins.loader import PluginMeta
+    from whaleclaw.plugins.sdk import WhaleclawPluginApi
+
+    existing = plugin_registry.get("evomap")
+    if existing:
+        await plugin_registry.unregister("evomap")
+
+    plugin = EvoMapPlugin()
+
+    def _evo_cfg(pid: str) -> dict[str, Any]:
+        raw = getattr(config, "plugins", {})
+        if isinstance(raw, dict):
+            val = raw.get(pid, {})
+            return val if isinstance(val, dict) else {}
+        return {}
+
+    api = WhaleclawPluginApi(
+        plugin_id="evomap",
+        get_config_fn=lambda pid, key, default: _evo_cfg(pid).get(key, default),
+        get_secret_fn=lambda pid, key: None,
+        channel_register_fn=lambda ch: None,
+        tool_register_fn=lambda t: tool_registry.register(t),
+        hook_register_fn=lambda h, cb, p: hook_manager.register(h, cb, p),
+        command_register_fn=lambda cmd, handler: None,
+    )
+
+    plugin.register(api)
+    meta = PluginMeta(
+        id="evomap",
+        name="EvoMap",
+        description="EvoMap collaborative evolution marketplace",
+        version="1.0.0",
+        author="WhaleClaw",
+        entry="whaleclaw.plugins.evomap.plugin",
+        path="",
+    )
+    await plugin_registry.register(plugin, meta)
+    await plugin.on_start()
+    log.info("evomap.dynamic_register_ok")
+
+
+def _unregister_evomap_tools(tool_registry: ToolRegistry) -> None:
+    """Remove all evomap_* tools from the registry."""
+    evomap_names = [t.name for t in tool_registry.list_tools() if t.name.startswith("evomap_")]
+    for name in evomap_names:
+        tool_registry.unregister(name)
+    if evomap_names:
+        log.info("evomap.tools_unregistered", tools=evomap_names)

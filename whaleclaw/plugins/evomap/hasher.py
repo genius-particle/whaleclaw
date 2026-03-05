@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Any
 
 
 class AssetHasher:
     """Compute content-addressable IDs for GEP-A2A assets."""
 
     @staticmethod
-    def compute_asset_id(asset: dict) -> str:
+    def compute_asset_id(asset: dict[str, Any]) -> str:
         """
         Compute asset ID: remove asset_id, canonical JSON, SHA256.
         Returns 'sha256:<hex>'.

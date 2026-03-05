@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+from typing import Any, cast
 
 from whaleclaw.plugins.evomap.bounty import BountyManager
 from whaleclaw.plugins.evomap.client import A2AClient
@@ -20,8 +20,15 @@ from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
 class EvoMapPublishTool(Tool):
     """发布解决方案到 EvoMap 网络。"""
 
-    def __init__(self, publisher: AssetPublisher) -> None:
+    def __init__(
+        self,
+        publisher: AssetPublisher,
+        client: A2AClient | None = None,
+        identity: EvoMapIdentity | None = None,
+    ) -> None:
         self._publisher = publisher
+        self._client = client
+        self._identity = identity
 
     @property
     def definition(self) -> ToolDefinition:
@@ -37,7 +44,10 @@ class EvoMapPublishTool(Tool):
                 ToolParameter(
                     name="signals",
                     type="string",
-                    description="逗号分隔的信号关键词",
+                    description=(
+                        "逗号分隔的泛化技术关键词（任务类型+技术栈，不含具体业务内容），"
+                        "如 'ppt,python-pptx,slide_generation' 或 'websocket,reconnect,backoff'"
+                    ),
                 ),
                 ToolParameter(
                     name="gene_summary",
@@ -67,13 +77,22 @@ class EvoMapPublishTool(Tool):
             ],
         )
 
+    async def _reauth(self) -> None:
+        if not self._client:
+            return
+        resp = await self._client.hello()
+        payload: Any = resp.get("payload") or {}
+        if self._identity and isinstance(payload, dict):
+            self._identity.save_hello_response(cast(dict[str, str | int | None], payload))
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         from whaleclaw.plugins.evomap.models import BlastRadius, Outcome
 
         signals = [s.strip() for s in str(kwargs.get("signals", "")).split(",") if s.strip()]
         if not signals:
             return ToolResult(success=False, output="", error="信号不能为空")
-        try:
+
+        async def _do_publish() -> str:
             result = await self._publisher.publish_fix(
                 category=kwargs.get("category", "repair"),
                 signals=signals,
@@ -86,16 +105,31 @@ class EvoMapPublishTool(Tool):
                 ),
                 outcome=Outcome(status="success", score=1.0),
             )
-            return ToolResult(success=True, output=str(result), error=None)
-        except Exception as e:
-            return ToolResult(success=False, output="", error=f"发布失败: {e}")
+            return str(result)
+
+        try:
+            out = await _do_publish()
+        except Exception:
+            try:
+                await self._reauth()
+                out = await _do_publish()
+            except Exception as e:
+                return ToolResult(success=False, output="", error=f"发布失败: {e}")
+        return ToolResult(success=True, output=out, error=None)
 
 
 class EvoMapFetchTool(Tool):
     """从 EvoMap 搜索已验证的解决方案。"""
 
-    def __init__(self, fetcher: AssetFetcher) -> None:
+    def __init__(
+        self,
+        fetcher: AssetFetcher,
+        client: A2AClient | None = None,
+        identity: EvoMapIdentity | None = None,
+    ) -> None:
         self._fetcher = fetcher
+        self._client = client
+        self._identity = identity
 
     @property
     def definition(self) -> ToolDefinition:
@@ -106,10 +140,26 @@ class EvoMapFetchTool(Tool):
                 ToolParameter(
                     name="signals",
                     type="string",
-                    description="逗号分隔的搜索关键词 (如错误类型、模块名)",
+                    description=(
+                        "逗号分隔的泛化技术关键词，用于匹配已有方案。"
+                        "只提取任务类型和技术栈，去掉具体业务内容。"
+                        "例：用户说'做个刘亦菲3页PPT' → 'ppt,python-pptx,slide_generation'；"
+                        "'WebSocket 断开重连' → 'websocket,reconnect,exponential_backoff'；"
+                        "'修复 SQL 慢查询' → 'sql_performance,n_plus_one,query_optimization'"
+                    ),
                 ),
             ],
         )
+
+    async def _reauth_and_retry(self, signals: list[str]) -> list[dict[str, Any]]:
+        """Re-authenticate via hello then retry fetch (secret may have expired)."""
+        if not self._client:
+            raise RuntimeError("no client")
+        resp = await self._client.hello()
+        payload: Any = resp.get("payload") or {}
+        if self._identity and isinstance(payload, dict):
+            self._identity.save_hello_response(cast(dict[str, str | int | None], payload))
+        return await self._fetcher.search_by_signals(signals)
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         signals = [s.strip() for s in str(kwargs.get("signals", "")).split(",") if s.strip()]
@@ -117,19 +167,29 @@ class EvoMapFetchTool(Tool):
             return ToolResult(success=False, output="", error="搜索关键词不能为空")
         try:
             assets = await self._fetcher.search_by_signals(signals)
-            out = "\n".join(
-                f"- {a.get('asset_id', '')}: {a.get('summary', '')}" for a in assets[:10]
-            )
-            return ToolResult(success=True, output=out or "未找到匹配方案", error=None)
-        except Exception as e:
-            return ToolResult(success=False, output="", error=f"搜索失败: {e}")
+        except Exception:
+            try:
+                assets = await self._reauth_and_retry(signals)
+            except Exception as e:
+                return ToolResult(success=False, output="", error=f"搜索失败: {e}")
+        out = "\n".join(
+            f"- {a.get('asset_id', '')}: {a.get('summary', '')}" for a in assets[:10]
+        )
+        return ToolResult(success=True, output=out or "未找到匹配方案", error=None)
 
 
 class EvoMapBountyTool(Tool):
     """查看和认领 EvoMap 赏金任务。"""
 
-    def __init__(self, bounty: BountyManager) -> None:
+    def __init__(
+        self,
+        bounty: BountyManager,
+        client: A2AClient | None = None,
+        identity: EvoMapIdentity | None = None,
+    ) -> None:
         self._bounty = bounty
+        self._client = client
+        self._identity = identity
 
     @property
     def definition(self) -> ToolDefinition:
@@ -157,33 +217,48 @@ class EvoMapBountyTool(Tool):
             ],
         )
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def _reauth(self) -> None:
+        if not self._client:
+            return
+        resp = await self._client.hello()
+        payload: Any = resp.get("payload") or {}
+        if self._identity and isinstance(payload, dict):
+            self._identity.save_hello_response(cast(dict[str, str | int | None], payload))
+
+    async def _execute_inner(self, **kwargs: Any) -> ToolResult:
         action = str(kwargs.get("action", "list"))
+        if action == "list":
+            tasks = await self._bounty.list_tasks()
+            out = "\n".join(f"- {t.task_id}: {t.title}" for t in tasks[:20])
+            return ToolResult(success=True, output=out or "暂无可用任务", error=None)
+        if action == "claim":
+            tid = kwargs.get("task_id")
+            if not tid:
+                return ToolResult(success=False, output="", error="需要 task_id")
+            await self._bounty.claim_task(str(tid))
+            return ToolResult(success=True, output=f"任务 {tid} 已认领", error=None)
+        if action == "complete":
+            tid = kwargs.get("task_id")
+            aid = kwargs.get("asset_id")
+            if not tid or not aid:
+                return ToolResult(success=False, output="", error="需要 task_id 和 asset_id")
+            await self._bounty.complete_task(str(tid), str(aid))
+            return ToolResult(success=True, output=f"任务 {tid} 已提交完成", error=None)
+        if action == "my_tasks":
+            tasks = await self._bounty.my_tasks()
+            out = "\n".join(f"- {t.task_id}: {t.title}" for t in tasks[:20])
+            return ToolResult(success=True, output=out or "无已认领任务", error=None)
+        return ToolResult(success=False, output="", error=f"未知操作: {action}")
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
         try:
-            if action == "list":
-                tasks = await self._bounty.list_tasks()
-                out = "\n".join(f"- {t.task_id}: {t.title}" for t in tasks[:20])
-                return ToolResult(success=True, output=out or "暂无可用任务", error=None)
-            if action == "claim":
-                tid = kwargs.get("task_id")
-                if not tid:
-                    return ToolResult(success=False, output="", error="需要 task_id")
-                await self._bounty.claim_task(str(tid))
-                return ToolResult(success=True, output=f"任务 {tid} 已认领", error=None)
-            if action == "complete":
-                tid = kwargs.get("task_id")
-                aid = kwargs.get("asset_id")
-                if not tid or not aid:
-                    return ToolResult(success=False, output="", error="需要 task_id 和 asset_id")
-                await self._bounty.complete_task(str(tid), str(aid))
-                return ToolResult(success=True, output=f"任务 {tid} 已提交完成", error=None)
-            if action == "my_tasks":
-                tasks = await self._bounty.my_tasks()
-                out = "\n".join(f"- {t.task_id}: {t.title}" for t in tasks[:20])
-                return ToolResult(success=True, output=out or "无已认领任务", error=None)
-            return ToolResult(success=False, output="", error=f"未知操作: {action}")
-        except Exception as e:
-            return ToolResult(success=False, output="", error=f"赏金操作失败: {e}")
+            return await self._execute_inner(**kwargs)
+        except Exception:
+            try:
+                await self._reauth()
+                return await self._execute_inner(**kwargs)
+            except Exception as e:
+                return ToolResult(success=False, output="", error=f"赏金操作失败: {e}")
 
 
 class EvoMapPlugin(WhaleclawPlugin):
@@ -194,6 +269,7 @@ class EvoMapPlugin(WhaleclawPlugin):
         self._publisher: AssetPublisher | None = None
         self._fetcher: AssetFetcher | None = None
         self._bounty: BountyManager | None = None
+        self._identity: EvoMapIdentity | None = None
         self._cfg: EvoMapConfig | None = None
         self._startup_task: asyncio.Task[None] | None = None
 
@@ -220,8 +296,10 @@ class EvoMapPlugin(WhaleclawPlugin):
             return None
         self._cfg = cfg
         identity = EvoMapIdentity()
+        self._identity = identity
         sender_id = identity.get_or_create_sender_id()
-        self._client = A2AClient(cfg.hub_url, sender_id)
+        cached_secret = identity.get_node_secret()
+        self._client = A2AClient(cfg.hub_url, sender_id, node_secret=cached_secret)
         self._publisher = AssetPublisher(self._client, identity)
         self._fetcher = AssetFetcher(self._client)
         self._bounty = BountyManager(self._client)
@@ -232,9 +310,9 @@ class EvoMapPlugin(WhaleclawPlugin):
         if not cfg:
             return
         assert self._publisher and self._fetcher and self._bounty
-        api.register_tool(EvoMapPublishTool(self._publisher))
-        api.register_tool(EvoMapFetchTool(self._fetcher))
-        api.register_tool(EvoMapBountyTool(self._bounty))
+        api.register_tool(EvoMapPublishTool(self._publisher, self._client, self._identity))
+        api.register_tool(EvoMapFetchTool(self._fetcher, self._client, self._identity))
+        api.register_tool(EvoMapBountyTool(self._bounty, self._client, self._identity))
         api.register_hook(HookPoint.BEFORE_MESSAGE, self._on_before_message_suggest)
         api.register_hook(HookPoint.ON_ERROR, self._on_error_search)
         api.register_hook(HookPoint.AFTER_TOOL_CALL, self._on_tool_success_publish)
@@ -286,7 +364,10 @@ class EvoMapPlugin(WhaleclawPlugin):
 
         async def _warmup() -> None:
             try:
-                await self._client.hello()
+                resp = await self._client.hello()
+                payload: Any = resp.get("payload") or {}
+                if self._identity and isinstance(payload, dict):
+                    self._identity.save_hello_response(cast(dict[str, str | int | None], payload))
                 await self._fetcher.fetch_promoted()
             except Exception:
                 pass

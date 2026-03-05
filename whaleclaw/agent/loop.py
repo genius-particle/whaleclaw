@@ -21,12 +21,7 @@ from typing import TYPE_CHECKING, cast
 
 from whaleclaw.agent.context import OnToolCall, OnToolResult
 from whaleclaw.agent.prompt import PromptAssembler
-from whaleclaw.config.schema import (
-    AgentConfig,
-    ModelsConfig,
-    SummarizerConfig,
-    WhaleclawConfig,
-)
+from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.providers.base import AgentResponse, ImageContent, Message, ToolCall
 from whaleclaw.providers.router import ModelRouter
 from whaleclaw.sessions.compressor import ContextCompressor
@@ -65,6 +60,11 @@ _OFFICE_PATH_RE = re.compile(r"(/[^\n\"']+\.(?:pptx|docx|xlsx))", re.IGNORECASE)
 _ABS_FILE_PATH_RE = re.compile(r"(/[^\s\"')]+?\.[A-Za-z0-9]{1,8})(?=[\s\"')]|$)")
 _NON_DELIVERY_EXTS = {".py", ".sh", ".bash", ".zsh", ".log", ".tmp"}
 _VERSION_SUFFIX_RE = re.compile(r"_V\d+$", re.IGNORECASE)
+_COORDINATOR_ASK_RE = re.compile(
+    r"(?:你要(?:我|什么)|需要你(?:提供|告诉|回复|回答|确认|选择)|"
+    r"请(?:告诉|选择|提供|告知)我|"
+    r"(?:按|用)(?:下面|以下)(?:模板|格式)(?:回|填|答))",
+)
 _EVOMAP_CHOICE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*(?:选|选择)?\s*([ABCabc])\s*$"),
     re.compile(r"^\s*(?:选|选择)?\s*([123])\s*$"),
@@ -251,7 +251,7 @@ def _build_skill_lock_system_message(skill_ids: list[str]) -> Message:
     )
 
 
-def _looks_like_skill_activation_message(text: str) -> bool:
+def _looks_like_skill_activation_message(text: str) -> bool:  # pyright: ignore[reportUnusedFunction]
     t = text.strip()
     if not t:
         return False
@@ -311,7 +311,7 @@ def _skill_token_mentioned(token: str, text: str) -> bool:
     return False
 
 
-def _skill_explicitly_mentioned(skill: Skill, text: str) -> bool:
+def _skill_explicitly_mentioned(skill: Skill, text: str) -> bool:  # pyright: ignore[reportUnusedFunction]
     return _skill_token_mentioned(skill.id, text) or _skill_token_mentioned(skill.name, text)
 
 
@@ -514,12 +514,13 @@ def _select_native_tool_names(registry: ToolRegistry, user_message: str) -> set[
 
 
 def _is_evomap_enabled(config: WhaleclawConfig) -> bool:
-    plugins_cfg = getattr(config, "plugins", {})
+    plugins_cfg = getattr(config, "plugins", None)
     if not isinstance(plugins_cfg, dict):
         return False
-    evomap_cfg = plugins_cfg.get("evomap", {})
-    if not isinstance(evomap_cfg, dict):
+    evomap_cfg_raw: object = plugins_cfg.get("evomap", None)  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
+    if not isinstance(evomap_cfg_raw, dict):
         return False
+    evomap_cfg: dict[str, object] = evomap_cfg_raw  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
     return bool(evomap_cfg.get("enabled", False))
 
 
@@ -790,7 +791,7 @@ def _extract_topic_terms(text: str, *, limit: int = 2) -> list[str]:
     return terms
 
 
-def _recommended_evomap_signals(text: str) -> str:
+def _recommended_evomap_signals(text: str) -> str:  # pyright: ignore[reportUnusedFunction]
     kind = _infer_task_kind(text)
     if kind == "ppt":
         base = [
@@ -1057,14 +1058,19 @@ def _extract_round_delivery_section(text: str) -> str:
     if not text:
         return ""
     marker = re.search(
-        r"(?m)^\s*3[\)\.、:：]\s*本轮可直接交付结果",
+        r"(?m)^\s*[1-5][\)\.、:：]\s*本轮可直接交付结果",
         text,
     )
+    if marker is None:
+        marker = re.search(
+            r"(?m)^\s*[1-5][\)\.、:：]\s*本轮可直接使用",
+            text,
+        )
     if marker is None:
         return text
     tail = text[marker.start() :]
     next_idx = len(tail)
-    next_marker = re.search(r"(?m)^\s*[4-9][\)\.、:：]\s*", tail)
+    next_marker = re.search(r"(?m)^\s*[2-9][\)\.、:：]\s*(?!本轮可直接)", tail)
     if next_marker is not None and next_marker.start() > 0:
         next_idx = next_marker.start()
     return tail[:next_idx].strip()
@@ -1101,6 +1107,70 @@ def _with_round_version_suffix(path: str, round_no: int) -> str:
     base_stem = _VERSION_SUFFIX_RE.sub("", stem)
     target_name = f"{base_stem}_V{round_no}{p.suffix}"
     return str(p.with_name(target_name))
+
+
+def _fix_version_suffix(paths: list[str], round_no: int) -> list[str]:
+    """Rename files whose _V suffix doesn't match the current round_no.
+
+    LLMs sometimes use the wrong version number (e.g. _V4 in round 3).
+    This renames the file on disk so later rounds don't collide.
+    """
+    fixed: list[str] = []
+    expected = f"_V{round_no}"
+    for p in paths:
+        fp = Path(p)
+        stem = fp.stem
+        m = _VERSION_SUFFIX_RE.search(stem)
+        if m is not None and m.group(0).upper() != expected.upper():
+            correct = _with_round_version_suffix(p, round_no)
+            correct_path = Path(correct)
+            try:
+                if correct_path.exists():
+                    correct_path.unlink()
+                fp.rename(correct_path)
+                fixed.append(str(correct_path))
+                continue
+            except OSError:
+                pass
+        fixed.append(p)
+    return fixed
+
+
+def _extract_artifact_baseline(paths: list[str]) -> str:
+    """Extract a structured quality baseline from delivered files.
+
+    Returns a compact string like:
+      "上轮基线 | 4页 | 每页图片数: P1=1,P2=1,P3=2,P4=1(共5张) | 每页文字数: P1=45,P2=120,P3=98,P4=80"
+    """
+    for p in paths:
+        fp = Path(p).expanduser()
+        if not fp.exists():
+            continue
+        suffix = fp.suffix.lower()
+        if suffix == ".pptx":
+            return _baseline_from_pptx(fp)
+    return ""
+
+
+def _baseline_from_pptx(fp: Path) -> str:
+    try:
+        from pptx import Presentation
+    except ImportError:
+        return ""
+    try:
+        prs = Presentation(str(fp))
+    except Exception:
+        return ""
+    slide_count = len(prs.slides)
+    total_images = 0
+    total_chars = 0
+    for slide in prs.slides:
+        total_images += sum(1 for s in slide.shapes if getattr(s, "shape_type", None) == 13)
+        for s in slide.shapes:
+            tf = getattr(s, "text_frame", None)
+            if tf is not None:
+                total_chars += len(str(getattr(tf, "text", "")).strip())
+    return f"上轮基线 | {slide_count}页 | {total_images}张图 | {total_chars}字"
 
 
 def _snapshot_round_artifacts(paths: list[str], round_no: int) -> list[str]:
@@ -1147,8 +1217,8 @@ def _is_office_edit_request(text: str) -> bool:
     q = text.lower()
     if not q:
         return False
-    edit_hints = ("改", "修改", "调整", "第一页", "第二页", "单元格", "段落")
-    doc_hints = ("ppt", "pptx", "word", "docx", "excel", "xlsx", "幻灯片", "文档", "表格")
+    edit_hints = ("改", "修改", "调整", "换", "替换", "更换", "删", "删除", "加", "添加", "插入", "第一页", "第二页", "第三页", "单元格", "段落", "封面")
+    doc_hints = ("ppt", "pptx", "word", "docx", "excel", "xlsx", "幻灯片", "文档", "表格", "封面", "页")
     return any(h in q for h in edit_hints) and any(h in q for h in doc_hints)
 
 
@@ -1236,7 +1306,7 @@ def _is_followup_edit_message(text: str) -> bool:
     q = text.lower()
     if not q:
         return False
-    hints = ("改一下", "修改", "调整", "第一页", "第一面", "第二页", "单元格", "段落")
+    hints = ("改一下", "修改", "调整", "换一", "替换", "更换", "删掉", "删除", "加一", "添加", "插入", "第一页", "第一面", "第二页", "第三页", "单元格", "段落", "封面图", "封面")
     return any(h in q for h in hints)
 
 
@@ -1279,6 +1349,11 @@ def _build_office_edit_hint_system_message(metadata: dict[str, object]) -> Messa
             "若涉及插图/音视频/风格升级/复杂排版，"
             "请先输出简短执行计划，"
             "再组合 browser、bash、file_write 与编辑工具执行。\n"
+            "图片操作规则：\n"
+            "- 换图/替换图片 → action=replace_image（删旧图+在原位置放新图）\n"
+            "- 新增图片 → action=add_image\n"
+            "- 删除图片 → action=remove_image\n"
+            "严禁用 add_image 来「换图」，那样旧图还在，新图只是盖在上面。\n"
             "必须优先修改用户明确点名的对象（页码/元素/文案），"
             "不要改成泛化动作（例如只改整页背景）。\n"
             "不要把复杂请求机械降级为“只能改文字”。\n"
@@ -1574,7 +1649,7 @@ def _parse_fallback_tool_calls(text: str) -> list[ToolCall]:
                 ToolCall(
                     id=f"fallback_{len(calls)}",
                     name=raw_name,
-                    arguments=raw_args,
+                    arguments=raw_args,  # pyright: ignore[reportUnknownArgumentType]
                 )
             )
 
@@ -1983,17 +2058,19 @@ def _repair_tool_call(tc: ToolCall, user_message: str) -> tuple[ToolCall, str | 
 
 
 def _multi_agent_cfg(config: WhaleclawConfig) -> dict[str, object]:
-    plugins = config.plugins if isinstance(config.plugins, dict) else {}
-    raw = plugins.get("multi_agent", {})
-    if not isinstance(raw, dict):
+    plugins_raw = config.plugins
+    plugins: dict[str, object] = plugins_raw if isinstance(plugins_raw, dict) else {}  # pyright: ignore[reportAssignmentType, reportUnnecessaryIsInstance]
+    raw_ma = plugins.get("multi_agent", {})
+    if not isinstance(raw_ma, dict):
         return {"enabled": False, "mode": "parallel", "max_rounds": 1, "roles": []}
 
+    raw: dict[str, object] = raw_ma  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
     enabled = bool(raw.get("enabled", False))
     mode_raw = str(raw.get("mode", "parallel")).strip().lower()
     mode = mode_raw if mode_raw in {"parallel", "serial"} else "parallel"
 
     try:
-        max_rounds = int(raw.get("max_rounds", 1))
+        max_rounds = int(raw.get("max_rounds", 1))  # pyright: ignore[reportArgumentType]
     except Exception:
         max_rounds = 1
     max_rounds = max(1, min(max_rounds, 10))
@@ -2001,21 +2078,22 @@ def _multi_agent_cfg(config: WhaleclawConfig) -> dict[str, object]:
     roles_raw = raw.get("roles")
     roles: list[dict[str, object]] = []
     if isinstance(roles_raw, list):
-        for idx, item in enumerate(roles_raw[:20], start=1):
+        for idx, item in enumerate(roles_raw[:20], start=1):  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
             if not isinstance(item, dict):
                 continue
-            rid = str(item.get("id", f"role_{idx}")).strip().lower()
+            role_item: dict[str, object] = item  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
+            rid = str(role_item.get("id", f"role_{idx}")).strip().lower()
             rid = "".join(ch for ch in rid if ch.isalnum() or ch in {"_", "-"})
             if not rid:
                 rid = f"role_{idx}"
-            name = str(item.get("name", f"角色{idx}")).strip() or f"角色{idx}"
-            model = str(item.get("model", "")).strip()
-            system_prompt = str(item.get("system_prompt", "")).strip()
+            name = str(role_item.get("name", f"角色{idx}")).strip() or f"角色{idx}"
+            model = str(role_item.get("model", "")).strip()
+            system_prompt = str(role_item.get("system_prompt", "")).strip()
             roles.append(
                 {
                     "id": rid[:64],
                     "name": name[:50],
-                    "enabled": bool(item.get("enabled", True)),
+                    "enabled": bool(role_item.get("enabled", True)),
                     "model": model[:100],
                     "system_prompt": system_prompt[:3000],
                 }
@@ -2067,7 +2145,7 @@ def _scenario_discuss_focus(scenario: str) -> str:
     return "重点和用户确认目标、约束、验收标准与最终交付物类型。"
 
 
-def _scenario_delivery_focus(scenario: str) -> str:
+def _scenario_delivery_focus(scenario: str) -> str:  # pyright: ignore[reportUnusedFunction]
     if scenario == "product_design":
         return (
             "最终答复必须包含：\n"
@@ -2143,14 +2221,16 @@ def _resolve_multi_agent_cfg(
 ) -> dict[str, object]:
     """Build effective multi-agent config with optional session overrides."""
     cfg = _multi_agent_cfg(config)
-    plugins = config.plugins if isinstance(config.plugins, dict) else {}
-    raw = plugins.get("multi_agent", {})
-    if isinstance(raw, dict):
-        scenario = str(raw.get("scenario", "software_development")).strip()
+    plugins_raw2 = config.plugins
+    plugins2: dict[str, object] = plugins_raw2 if isinstance(plugins_raw2, dict) else {}  # pyright: ignore[reportAssignmentType, reportUnnecessaryIsInstance]
+    raw = plugins2.get("multi_agent", {})
+    if isinstance(raw, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raw_typed: dict[str, object] = raw  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
+        scenario = str(raw_typed.get("scenario", "software_development")).strip()
         cfg["scenario"] = scenario or "software_development"
     else:
         cfg["scenario"] = "software_development"
-    if session is None or not isinstance(session.metadata, dict):
+    if session is None or not isinstance(session.metadata, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
         return cfg
 
     metadata = session.metadata
@@ -2225,7 +2305,7 @@ def _is_multi_agent_discuss_done(text: str) -> bool:
     return any(p.search(t) for p in _MULTI_AGENT_DISCUSS_DONE_PATTERNS)
 
 
-def _format_multi_agent_preflight_text(
+def _format_multi_agent_preflight_text(  # pyright: ignore[reportUnusedFunction]
     *,
     cfg: dict[str, object],
     topic: str,
@@ -2274,6 +2354,11 @@ async def _persist_session_metadata(
 ) -> bool:
     if session is None or session_manager is None:
         return False
+    try:
+        await session_manager.update_metadata(session, session.metadata)
+    except Exception:
+        return False
+    return True
 
 
 async def _sync_multi_agent_compression_boundary(
@@ -2289,8 +2374,8 @@ async def _sync_multi_agent_compression_boundary(
     When MA turns off, record a fixed message-index boundary so future
     group-compression only applies to newly produced messages.
     """
-    if session is None or not isinstance(session.metadata, dict):
-        return
+    if session is None or not isinstance(session.metadata, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return None
     metadata = session.metadata
     prev_active = bool(metadata.get("multi_agent_active_prev", False))
     changed = False
@@ -2303,7 +2388,7 @@ async def _sync_multi_agent_compression_boundary(
             metadata["multi_agent_active_prev"] = False
             metadata["compression_resume_message_index"] = len(session.messages)
             changed = True
-    if group_compressor is not None and session is not None:
+    if group_compressor is not None:  # session already checked above
         try:
             await group_compressor.set_session_suspended(
                 session_id=session.id,
@@ -2318,22 +2403,24 @@ async def _sync_multi_agent_compression_boundary(
             )
     if changed:
         await _persist_session_metadata(session, session_manager)
+    if session_manager is None:
+        return None
     try:
         await asyncio.wait_for(
-            session_manager._store.update_session_field(  # noqa: SLF001
+            session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                 session.id,
                 metadata=session.metadata,
             ),
             timeout=1.5,
         )
-        return True
+        return None
     except Exception as exc:
         log.warning(
             "agent.multi_agent_metadata_persist_failed",
             session_id=session.id,
             error=str(exc),
         )
-        return False
+        return None
 
 
 async def _run_multi_agent_controller_discussion(
@@ -2360,8 +2447,8 @@ async def _run_multi_agent_controller_discussion(
     scenario = str(cfg.get("scenario", "software_development")).strip()
     scenario_label = _MULTI_AGENT_SCENARIO_LABELS.get(scenario, scenario or "自定义")
     discuss_focus = _scenario_discuss_focus(scenario)
-    role_lines = []
-    role_bullets = []
+    role_lines: list[str] = []
+    role_bullets: list[str] = []
     for role in roles:
         name = str(role.get("name", role.get("id", "角色"))).strip() or "角色"
         duty = _multi_agent_system_prompt(role)
@@ -2372,10 +2459,13 @@ async def _run_multi_agent_controller_discussion(
 
     discuss_prompt = (
         "你是“多Agent主控协调者”。当前阶段只做需求澄清，不允许启动多角色执行。\n"
-        "请复述你理解的用户目标，再给 2-3 条有价值建议，最后提出最多 3 个澄清问题。\n"
+        "请先准确理解用户原始表述的核心意图，再结合场景模板提供专业视角。\n"
+        "当用户意图与模板默认方向不一致时，以用户意图为准（如用户要“写真PPT”是做展示，不是做策划方案）。\n"
+        "请复述你理解的用户目标（忠实于用户原话的核心意图），"
+        "再给 2-3 条有价值建议，最后提出最多 3 个澄清问题。\n"
         "如果信息已经足够执行，也不要直接执行，只需提示用户回复“确认需求”后立即启动多Agent执行。\n"
         "语气自然，不要像程序状态页。\n\n"
-        f"场景澄清重点：{discuss_focus}\n\n"
+        f"场景澄清重点（提供专业框架，与用户意图结合使用）：{discuss_focus}\n\n"
         f"当前配置：场景={scenario_label}，模式={mode}，最大回合={rounds}\n"
         f"角色分工：\n{role_block}\n\n"
         f"累计议题：\n{pending_topic}\n\n"
@@ -2472,10 +2562,19 @@ def _looks_like_bad_coordinator_output(text: str) -> bool:
         "为了我马上开工",
         "我就能继续",
         "我才能继续",
+        "你要我交付",
+        "你只要按",
+        "回一条就行",
+        "回一条即可",
+        "需要你补",
+        "你需要补",
+        "你想要什么",
+        "你想让我",
+        "交付物类型：",
     )
     if any(h in t for h in ask_user_hints):
         return True
-    if ("?" in t or "？" in t) and ("你" in t or "请" in t):
+    if _COORDINATOR_ASK_RE.search(t):
         return True
     if t.startswith("我将使用 ") and " 技能继续完成任务" in t:
         return True
@@ -2625,10 +2724,7 @@ def _choose_round_tool_lock(
 
 
 def _clip_text_for_role_view(text: str, max_chars: int = 200) -> str:
-    t = " ".join(text.split()).strip()
-    if len(t) <= max_chars:
-        return t
-    return t[:max_chars] + "..."
+    return " ".join(text.split()).strip() or "（无输出）"
 
 
 def _build_multi_agent_requirement_baseline(
@@ -2679,7 +2775,12 @@ async def _run_multi_agent_executor(
     max_rounds = cast(int, ma_cfg["max_rounds"])
     scenario = str(ma_cfg.get("scenario", "software_development")).strip()
     requested_deliverables = _extract_requested_deliverables(message)
-    include_image_output = "image" in requested_deliverables or _need_image_output(message)
+    _visual_file_types = {"ppt", "word", "html", "pdf"}
+    include_image_output = (
+        "image" in requested_deliverables
+        or bool(_visual_file_types & set(requested_deliverables))
+        or _need_image_output(message)
+    )
     requirement_baseline = _build_multi_agent_requirement_baseline(
         message=message,
         scenario=scenario,
@@ -2695,7 +2796,7 @@ async def _run_multi_agent_executor(
     history_blocks: list[str] = []
     round_deliveries: list[str] = []
     shared_context = ""
-    last_delivery_paths: list[str] = []
+    prev_round_artifact_baseline: str = ""
 
     async def _run_one_role(
         role: dict[str, object],
@@ -2715,21 +2816,23 @@ async def _run_multi_agent_executor(
             f"角色职责：{prompt}\n"
             f"当前是协作第 {round_no}/{max_rounds} 轮。\n"
             f"用户原始议题：{message}\n"
+            "请结合角色专长和场景模板发表观点，但方向须服从用户原始议题的核心意图。\n"
         )
         role_msg += f"\n{requirement_baseline}\n"
         if context_block:
             role_msg += f"\n前序协作要点：\n{context_block}\n"
-        if last_delivery_paths:
-            hint_lines = [f"- {p}" for p in last_delivery_paths]
+        if round_no > 1 and round_deliveries:
+            prev_summary = _extract_round_delivery_section(round_deliveries[-1]) or round_deliveries[-1]
+            prev_summary = _truncate_to_tokens(prev_summary, 400)
             role_msg += (
-                "\n上一轮最终交付路径（读取这些文件继续优化，并另存为本轮新版本，不要覆盖旧版）：\n"
-                + "\n".join(hint_lines)
+                f"\n上一轮（第 {round_no - 1} 轮）交付内容摘要（仅供参考，本轮须重新制作，不要读取或修改上一轮文件）：\n"
+                + prev_summary
                 + "\n"
             )
         role_msg += (
             f"\n本轮工具锁定：{', '.join(round_tools)}\n"
-            "\n请只输出“本角色观点（<=200字）”。\n"
-            "要求：必须给出明确判断/建议；不要列步骤。\n"
+            "\n请只输出本角色观点，必须总结为200字以内的精炼观点（严格不超过200字）。\n"
+            "要求：给出明确判断和建议，用连贯段落表达，不要分点罗列，不要列步骤。\n"
             "限制：\n"
             "- 不要向用户追问或索取额外材料。\n"
             "- 信息不足时请自行做“最小必要假设”，并在输出中明确标注“假设”。\n"
@@ -2850,54 +2953,66 @@ async def _run_multi_agent_executor(
         history_blocks.append(role_round_block)
 
         requested_text = ", ".join(requested_deliverables) if requested_deliverables else "未指定"
-        round_synthesize_message = (
-            "你是“结果协调者 Agent”。请基于本轮角色输出，给出“本轮唯一交付结果”。\n"
-            f"用户原始议题：{message}\n"
-            f"当前场景：{_MULTI_AGENT_SCENARIO_LABELS.get(scenario, scenario or '自定义')}\n"
-            f"当前轮次：第 {round_no}/{max_rounds} 轮\n\n"
-            f"{requirement_baseline}\n"
-            f"本轮工具锁定：{', '.join(round_tools)}\n"
-            f"用户要求交付类型：{requested_text}\n"
-            f"本轮角色输出：\n{role_round_block}\n\n"
-            "输出格式（严格遵守，精简）：\n"
-            f"## 第 {round_no} 轮交付\n"
-            "1) 本轮工具锁定（原样回写）\n"
-            "2) 角色观点（4条，每条<=200字）\n"
-            "3) 本轮可直接交付结果（必须给出具体内容）\n"
-            "4) 结果协调者执行记录（本轮调用了哪些工具、产出什么路径）\n"
-            "5) 与上一轮相比的改进点（没有则写“首轮基线”）\n"
-            "限制：\n"
-            "- 禁止向用户提问。\n"
-            "- 禁止要求用户补充材料。\n"
-            "- 不要解释过程，不要贴角色原文。\n"
-            "- 禁止出现“我将使用xx技能继续完成任务”这类过程话术。\n"
-            "- 总长度控制在 700-1200 中文字符。\n"
-            "- 若用户明确要求了文件类型（如 html/excel/word/ppt/pdf），"
-            "必须调用工具真实生成并返回绝对路径。\n"
-            "- 若已有上一轮文件路径，必须在其基础上优化，但最终请另存为本轮新版本文件，"
-            "文件名后缀使用 `_V轮次`（如 `_V2`），不要覆盖上一轮。\n"
+        _file_deliverable_types = {"ppt", "word", "excel", "html", "pdf"}
+        requires_file_output = bool(
+            _file_deliverable_types & set(requested_deliverables)
         )
-        if last_delivery_paths:
-            path_lines = [f"- {p}" for p in last_delivery_paths]
-            round_synthesize_message += (
-                "\n上一轮可复用最终交付路径：\n"
-                + "\n".join(path_lines)
-                + "\n"
+        prev_round_block = ""
+        if round_no > 1 and round_deliveries:
+            prev_summary = _extract_round_delivery_section(round_deliveries[-1]) or round_deliveries[-1]
+            prev_summary = _truncate_to_tokens(prev_summary, 400)
+            prev_round_block = (
+                f"上一轮摘要（仅供参考，本轮须独立完成）：\n{prev_summary}\n"
             )
+            if prev_round_artifact_baseline:
+                prev_round_block += (
+                    f"{prev_round_artifact_baseline}\n"
+                    "本轮不得少于上轮，配图须重新搜索，布局和文案应有迭代。\n"
+                )
+
+        image_instruction = ""
         if include_image_output:
-            round_synthesize_message += (
-                "附加要求（必须满足）：\n"
-                "- 增加“4) 配图”章节。\n"
-                "- 配图数量不要写死：应根据本轮交付内容的页数/模块数与信息密度决定，"
-                "确保关键页面或关键模块都有对应图片支撑。\n"
-                "- 无论交付是 PPT/Word/HTML/PDF 等，都请先列“结构化配图清单”"
-                "（按页/按章节/按模块，注明每块需要几张、主体是什么），"
-                "再按清单逐项拉图；不同主体必须分别调用 search_images。\n"
-                "- 除非用户明确同意，不要把同一张图重复用于多页。\n"
-                "- 若有真实图片链接，用 Markdown 图片格式给出；\n"
-                "- 若无真实图片，给“可直接用于生成图”的提示词"
-                "（含主体/场景/风格/光线/构图）。\n"
+            image_instruction = (
+                "配图流程：先列配图清单（按页/模块），再逐项调用 search_images 搜图下载，"
+                "不同主体分别搜索，同一张图不要用于多页。\n"
             )
+
+        round_synthesize_message: str = (
+            "你是结果协调者。基于角色输出，独立完成本轮交付。\n"
+            "【最高优先级】禁止向用户提问、要求补充材料或输出需求澄清模板。"
+            "禁止输出执行计划或步骤预告（如「我先搜图再写脚本」「请稍等」），直接调用工具执行。"
+            "你必须直接给出完整交付结果，信息不足时自行合理假设并执行。\n"
+            "【语言】所有输出（文本、脚本中的文案、文件内容）的语言必须与用户议题的语言一致。\n"
+            f"议题：{message}\n"
+            f"场景：{_MULTI_AGENT_SCENARIO_LABELS.get(scenario, scenario or '自定义')}\n"
+            f"轮次：第 {round_no}/{max_rounds} 轮\n"
+            f"{requirement_baseline}\n"
+            f"工具锁定：{', '.join(round_tools)}\n"
+            f"交付类型：{requested_text}\n"
+            f"角色输出：\n{role_round_block}\n\n"
+            f"{prev_round_block}"
+            f"{image_instruction}"
+            "\n"
+            f"## 第 {round_no} 轮交付（严格按此格式，每项必写）\n"
+            "1. 本轮工具锁定（原样回写）\n"
+            "2. 本轮可直接交付结果（必须给出具体内容）\n"
+            "3. 配图\n"
+            "4. 与上一轮相比的改进点（首轮写「首轮基线」）\n"
+            "\n"
+            "规则：\n"
+            f"- 需要文件时必须调用工具生成并返回绝对路径，文件名必须用 _V{round_no} 后缀（当前是第{round_no}轮，只能用 _V{round_no}）。\n"
+            "- 脚本中图片路径硬编码绝对路径，禁止 os.environ。\n"
+            "- PPT 插图直接用 slide.shapes.add_picture(path, left, top, width=w, height=h)，"
+            "严禁对图片做任何预处理（禁止 PIL resize/crop/thumbnail，禁止 cv2 resize），"
+            "系统会自动后处理人脸感知裁剪。\n"
+            "- PPT 中文字必须在图片上方（先 add_picture 再 add_textbox），"
+            "文本框之间不要位置重叠。\n"
+            "- PPT 文本框必须设置 word_wrap=True，"
+            "所有文本框的右边界不得超过幻灯片宽度。\n"
+            "- PPT 布局：只有封面页可以用全屏大图做背景，内容页必须采用图文混排布局"
+            "（如左图右文、上图下文、图占页面1/3~1/2），禁止每页都铺满整张图。\n"
+            "- 不允许越做越差。\n"
+        )
         round_delivery = ""
         delivery_accepted = False
         last_round_error = ""
@@ -2942,64 +3057,113 @@ async def _run_multi_agent_executor(
             except Exception as exc:
                 return "", False, str(exc)
 
+        def _has_real_file_in_output(text: str) -> bool:
+            paths = _extract_delivery_artifact_paths(text, include_scripts=False)
+            if any(Path(p).expanduser().exists() for p in paths):
+                return True
+            script_paths: list[str] = []
+            for m in _ABS_FILE_PATH_RE.finditer(text):
+                p = m.group(1).strip()
+                if not p:
+                    continue
+                suffix = Path(p).suffix.lower()
+                if suffix in _NON_DELIVERY_EXTS:
+                    script_paths.append(p)
+                    continue
+                if Path(p).expanduser().exists():
+                    return True
+            for sp in script_paths:
+                sp_path = Path(sp).expanduser()
+                if not sp_path.exists() or sp_path.suffix.lower() != ".py":
+                    continue
+                try:
+                    script_text = sp_path.read_text("utf-8", errors="ignore")[:8000]
+                except Exception:
+                    continue
+                for sm in _ABS_FILE_PATH_RE.finditer(script_text):
+                    sp2 = sm.group(1).strip()
+                    if not sp2:
+                        continue
+                    if Path(sp2).suffix.lower() in _NON_DELIVERY_EXTS:
+                        continue
+                    if Path(sp2).expanduser().exists():
+                        return True
+            return False
+
         first_out, first_ok, first_err = await _run_round_coordinator(1)
+        file_missing_on_first = False
         if first_ok:
             round_delivery = first_out
             delivery_accepted = True
-        else:
+            if requires_file_output and not _has_real_file_in_output(first_out):
+                file_missing_on_first = True
+                delivery_accepted = False
+                last_round_error = "协调者未产出实际文件（只有文字或脚本，没有最终交付文件）"
+                if on_stream is not None:
+                    await on_stream(
+                        f"[多Agent] 第 {round_no} 轮未检测到交付文件，自动重跑。"
+                    )
+        if not delivery_accepted and not first_ok:
             last_round_error = first_err
             if on_stream is not None:
                 await on_stream(
                     f"[多Agent] 第 {round_no} 轮首次失败，自动重跑本轮一次（止损上限=2次）。"
                 )
-            second_out, second_ok, second_err = await _run_round_coordinator(2)
+        if not delivery_accepted:
+            retry_msg = round_synthesize_message
+            if requires_file_output:
+                retry_msg += (
+                    "\n重要：上一次尝试未产出实际文件。本次你必须完成以下全部步骤，不可只输出文字就结束：\n"
+                    "步骤1) search_images 搜图并下载（按配图清单搜，搜完立刻进入步骤2，不要反复追加搜图）\n"
+                    "步骤2) file_write 写完整 Python 生成脚本到 /tmp/（图片路径硬编码为步骤1的绝对路径）\n"
+                    "步骤3) bash 执行脚本产出最终文件（.pptx/.docx/.xlsx/.html/.pdf）\n"
+                    "步骤4) 在交付文本中写明最终文件的绝对路径\n"
+                    "关键：搜图完成后必须立刻写脚本执行，不要停留在搜图步骤。\n"
+                )
+            second_out, second_ok, second_err = await _run_round_coordinator(
+                2, base_message=retry_msg
+            )
             if second_ok:
                 round_delivery = second_out
                 delivery_accepted = True
-            else:
-                if second_out:
-                    round_delivery = second_out
+                if requires_file_output and not _has_real_file_in_output(second_out):
+                    delivery_accepted = False
+            if not delivery_accepted:
                 last_round_error = second_err or last_round_error
+                best_text = second_out or (first_out if file_missing_on_first else "")
+                if requires_file_output and best_text and not _has_real_file_in_output(best_text):
+                    pass
+                elif best_text:
+                    round_delivery = best_text
+                    delivery_accepted = True
 
         if not delivery_accepted:
             fallback_base = (
                 f"## 第 {round_no} 轮交付\n"
                 f"1) 本轮工具锁定：{', '.join(round_tools)}\n"
-                "2) 角色观点（4条）：\n"
-                + "\n".join(lines[1:])
-                + "\n"
             )
             if round_no > 1 and round_deliveries:
                 prev = _extract_round_delivery_section(round_deliveries[-1]) or round_deliveries[-1]
                 base = (
                     fallback_base
-                    + "3) 本轮可直接交付结果（降级继承上一轮并保持可用）：\n"
+                    + "2) 本轮可直接交付结果（降级参考上一轮内容）：\n"
                     + prev
                     + "\n"
-                    + "4) 结果协调者执行记录：本轮协调输出未达交付标准，"
-                    + "已自动继承上一轮最终交付作为本轮基线，避免内容漂移。"
+                    + "3) 结果协调者执行记录：本轮协调输出未达交付标准，"
+                    + "已参考上一轮交付内容生成本轮基线。"
                 )
                 if last_round_error:
                     base += f" 错误摘要：{last_round_error[:180]}"
                 base += "\n"
-                if last_delivery_paths:
-                    path_lines = [f"- {p}" for p in last_delivery_paths]
-                    base += "   复用文件路径：\n" + "\n".join(path_lines) + "\n"
-                base += "5) 与上一轮相比的改进点：本轮为稳定性兜底，未引入新改动。\n"
+                base += "4) 与上一轮相比的改进点：本轮为稳定性兜底，未引入新改动。\n"
             else:
                 base = (
                     fallback_base
-                    + "3) 本轮可直接使用的产物：\n"
+                    + "2) 本轮可直接使用的产物：\n"
                     "- 基于角色观点的可执行摘要\n"
                     "- 当前轮次的风险与下一步建议\n"
-                    "4) 结果协调者执行记录：未拿到稳定工具回执，已返回可直接使用文本版本。\n"
-                    "5) 与上一轮相比的改进点：首轮基线。\n"
-                )
-            if include_image_output:
-                base += (
-                    "6) 配图：\n"
-                    "- 提示词：一个极简现代马克杯放在木质办公桌上，清晨自然光，"
-                    "45度侧拍，浅景深，真实摄影风格，4:3构图。\n"
+                    "3) 结果协调者执行记录：未拿到稳定工具回执，已返回可直接使用文本版本。\n"
+                    "4) 与上一轮相比的改进点：首轮基线。\n"
                 )
             round_delivery = base
             aborted_round_no = round_no
@@ -3015,16 +3179,17 @@ async def _run_multi_agent_executor(
             for p in detected_paths
             if Path(p).expanduser().exists()
         ]
+        existing_paths = _fix_version_suffix(existing_paths, round_no)
         if existing_paths:
             verified_lines = [f"- {p}" for p in existing_paths]
             round_delivery = (
                 f"{round_delivery.rstrip()}\n\n"
-                "7) 系统校验的实际产物绝对路径（以此为准）\n"
+                "6) 系统校验的实际产物绝对路径（以此为准）\n"
                 + "\n".join(verified_lines)
             )
         if existing_paths:
-            versioned_paths = _snapshot_round_artifacts(existing_paths, round_no)
-            last_delivery_paths = versioned_paths or existing_paths
+            _snapshot_round_artifacts(existing_paths, round_no)
+            prev_round_artifact_baseline = _extract_artifact_baseline(existing_paths)
         context_chunks: list[str] = []
         for idx, delivery in enumerate(round_deliveries, 1):
             section = _extract_round_delivery_section(delivery) or delivery
@@ -3033,14 +3198,16 @@ async def _run_multi_agent_executor(
             f"{requirement_baseline}\n\n" + "\n\n".join(context_chunks),
             1400,
         )
+        display_delivery = f"{role_round_block}\n\n{round_delivery}"
+
         if on_round_result is not None:
-            await on_round_result(round_no, round_delivery)
+            await on_round_result(round_no, display_delivery)
 
         if on_stream is not None:
             await on_stream(
                 "[多Agent] "
                 f"第 {round_no} 轮交付：\n"
-                f"{round_delivery}\n"
+                f"{display_delivery}\n"
             )
 
         if aborted_round_no == round_no:
@@ -3090,9 +3257,9 @@ async def run_agent(
     4. Execute tools, append results, loop (until no tool calls or token budget exhausted)
     5. Return final text reply
     """
-    agent_cfg = cast(AgentConfig, config.agent)
-    models_cfg = cast(ModelsConfig, config.models)
-    summarizer_cfg = cast(SummarizerConfig, agent_cfg.summarizer)
+    agent_cfg = config.agent
+    models_cfg = config.models
+    summarizer_cfg = agent_cfg.summarizer
 
     model_id: str = session.model if session else agent_cfg.model
     if router is None:
@@ -3220,7 +3387,7 @@ async def run_agent(
                     )
 
                 if waiting and _is_multi_agent_confirm(message):
-                    topic = pending_topic or message
+                    topic = pending_topic or "（请补充你的任务目标）"
                     rounds_raw = session.metadata.get("multi_agent_pending_rounds")
                     if isinstance(rounds_raw, int):
                         ma_cfg["max_rounds"] = max(1, min(rounds_raw, 10))
@@ -3324,6 +3491,8 @@ async def run_agent(
     llm_message = message
     locked_skill_ids: list[str] = []
     previous_locked_skill_ids: list[str] = []
+    lock_is_explicit = False
+    pending_lock_skill_ids: list[str] = []
     lock_waiting_done = False
     skill_announce_pending = False
     routed_skills: list[Skill] = []
@@ -3333,14 +3502,17 @@ async def run_agent(
             raw_locked = session.metadata.get("locked_skill_ids")
             if isinstance(raw_locked, list):
                 locked_skill_ids = [
-                    str(x).strip().lower()
-                    for x in raw_locked
+                    str(x).strip().lower()  # pyright: ignore[reportUnknownArgumentType]
+                    for x in raw_locked  # pyright: ignore[reportUnknownVariableType]
                     if isinstance(x, str) and str(x).strip()
                 ]
+                if locked_skill_ids:
+                    lock_is_explicit = True
             elif isinstance(session.metadata.get("forced_skill_id"), str):
                 legacy_forced = str(session.metadata.get("forced_skill_id", "")).strip().lower()
                 if legacy_forced:
                     locked_skill_ids = [legacy_forced]
+                    lock_is_explicit = True
                     session.metadata["locked_skill_ids"] = locked_skill_ids
                     session.metadata.pop("forced_skill_id", None)
                     metadata_dirty = True
@@ -3354,6 +3526,8 @@ async def run_agent(
             use_skill_ids, remainder = use_cmd
             if len(use_skill_ids) == 1 and use_skill_ids[0] in _USE_CLEAR_IDS:
                 locked_skill_ids = []
+                lock_is_explicit = False
+                pending_lock_skill_ids = []
                 lock_waiting_done = False
                 skill_announce_pending = False
                 if session is not None:
@@ -3366,6 +3540,7 @@ async def run_agent(
                     llm_message = remainder
             else:
                 locked_skill_ids = use_skill_ids
+                lock_is_explicit = True
                 lock_waiting_done = False
                 skill_announce_pending = True
                 if session is not None:
@@ -3376,6 +3551,7 @@ async def run_agent(
                 llm_message = remainder or f"使用技能 {', '.join(locked_skill_ids)} 处理当前请求。"
         elif lock_waiting_done and _is_task_done_confirmation(message):
             locked_skill_ids = []
+            lock_is_explicit = False
             lock_waiting_done = False
             if session is not None:
                 session.metadata.pop("locked_skill_ids", None)
@@ -3383,7 +3559,7 @@ async def run_agent(
                 session.metadata.pop("skill_lock_announce_pending", None)
                 session.metadata.pop("skill_param_state", None)
                 if session_manager is not None:
-                    await session_manager._store.update_session_field(  # noqa: SLF001
+                    await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                         session.id,
                         metadata=session.metadata,
                     )
@@ -3398,17 +3574,10 @@ async def run_agent(
         routed_skill_ids = _normalize_skill_ids(routed_skills)
 
         if not locked_skill_ids and routed_skill_ids:
-            locked_skill_ids = routed_skill_ids
-            lock_waiting_done = False
-            skill_announce_pending = True
-            if session is not None:
-                session.metadata["locked_skill_ids"] = locked_skill_ids
-                session.metadata["skill_lock_waiting_done"] = False
-                session.metadata["skill_lock_announce_pending"] = True
-                metadata_dirty = True
+            pending_lock_skill_ids = routed_skill_ids
 
-        if locked_skill_ids and routed_skill_ids and routed_skill_ids != locked_skill_ids:
-            if _is_skill_switch_consent(message):
+        if lock_is_explicit and locked_skill_ids and routed_skill_ids and routed_skill_ids != locked_skill_ids:
+            if _is_skill_switch_consent(message) or _looks_like_skill_activation_message(message):
                 locked_skill_ids = routed_skill_ids
                 lock_waiting_done = False
                 skill_announce_pending = True
@@ -3418,29 +3587,23 @@ async def run_agent(
                     session.metadata["skill_lock_announce_pending"] = True
                     metadata_dirty = True
             else:
-                locked = ", ".join(locked_skill_ids)
-                target = ", ".join(routed_skill_ids)
-                return (
-                    f"当前任务仍锁定在技能：{locked}。\n"
-                    f"检测到你可能想切到：{target}。\n"
-                    "请先确认：回复“同意切换技能”，我再切换继续。"
-                )
+                routed_skill_ids = locked_skill_ids
 
-        if locked_skill_ids and not lock_waiting_done and session is not None:
+        if lock_is_explicit and locked_skill_ids and not lock_waiting_done and session is not None:
             locked_skills = _assembler.route_skills(llm_message, forced_skill_ids=locked_skill_ids)
             guards = _guarded_skills(locked_skills)
             if guards:
                 state_map_raw = session.metadata.get("skill_param_state")
-                state_map = state_map_raw.copy() if isinstance(state_map_raw, dict) else {}
+                state_map: dict[str, dict[str, object]] = state_map_raw.copy() if isinstance(state_map_raw, dict) else {}  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
                 missing_any = False
                 for skill in guards:
                     guard = skill.param_guard
                     if guard is None:
                         continue
                     skill_state_raw = state_map.get(skill.id, {})
-                    skill_state = (
-                        skill_state_raw.copy()
-                        if isinstance(skill_state_raw, dict)
+                    skill_state: dict[str, object] = (
+                        skill_state_raw.copy()  # pyright: ignore[reportUnknownMemberType]
+                        if isinstance(skill_state_raw, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
                         else {}
                     )
                     updated, missing = _update_guard_state(
@@ -3452,13 +3615,13 @@ async def run_agent(
                 metadata_dirty = True
                 if missing_any:
                     if session_manager is not None:
-                        await session_manager._store.update_session_field(  # noqa: SLF001
+                        await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                             session.id,
                             metadata=session.metadata,
                         )
                     blocks = [
                         _build_skill_param_guard_reply(
-                            s.id, s.param_guard.params, state_map.get(s.id, {})
+                            s.id, s.param_guard.params, state_map.get(s.id, {})  # pyright: ignore[reportUnknownArgumentType]
                         )
                         for s in guards
                         if s.param_guard is not None
@@ -3468,14 +3631,15 @@ async def run_agent(
     if session is not None:
         pending_raw = session.metadata.get("evomap_pending_choices")
         if isinstance(pending_raw, dict):
-            options_raw = pending_raw.get("options")
+            options_raw: object = pending_raw.get("options")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
             options: list[dict[str, str]] = []
             if isinstance(options_raw, list):
-                for item in options_raw:
+                for item in options_raw:  # pyright: ignore[reportUnknownVariableType]
                     if not isinstance(item, dict):
                         continue
-                    aid = str(item.get("asset_id", "")).strip()
-                    summary = str(item.get("summary", "")).strip()
+                    opt: dict[str, object] = item  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
+                    aid = str(opt.get("asset_id", "")).strip()
+                    summary = str(opt.get("summary", "")).strip()
                     if not summary and not aid:
                         continue
                     options.append({"asset_id": aid, "summary": summary})
@@ -3488,7 +3652,7 @@ async def run_agent(
                 extra_memory = (
                     f"{selected_hint}\n{extra_memory}" if extra_memory.strip() else selected_hint
                 )
-                origin_message = str(pending_raw.get("origin_message", "")).strip()
+                origin_message = str(pending_raw.get("origin_message", "")).strip()  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
                 if origin_message:
                     llm_message = (
                         f"{origin_message}\n"
@@ -3497,7 +3661,7 @@ async def run_agent(
                     )
                 session.metadata.pop("evomap_pending_choices", None)
                 if session_manager is not None:
-                    await session_manager._store.update_session_field(  # noqa: SLF001
+                    await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                         session.id,
                         metadata=session.metadata,
                     )
@@ -3574,7 +3738,7 @@ async def run_agent(
         desired = "start" if phase == "NEW_TASK" else "editing"
         if desired != evomap_phase:
             session.metadata["evomap_phase"] = desired
-            await session_manager._store.update_session_field(  # noqa: SLF001
+            await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                 session.id,
                 metadata=session.metadata,
             )
@@ -3616,14 +3780,15 @@ async def run_agent(
         "" if native_tools else registry.to_prompt_fallback(include_names=fallback_names)
     )
 
+    effective_skill_ids = locked_skill_ids or pending_lock_skill_ids or None
     system_messages = _assembler.build(
         config,
         llm_message,
         tool_fallback_text=fallback_text,
         assistant_name=assistant_name,
-        forced_skill_ids=locked_skill_ids or None,
+        forced_skill_ids=effective_skill_ids,
     )
-    if locked_skill_ids:
+    if lock_is_explicit and locked_skill_ids:
         system_messages.append(_build_skill_lock_system_message(locked_skill_ids))
     _append_office_system_hints(system_messages, session, llm_message)
     image_api_probe_guard_enabled = _is_image_generation_request(llm_message)
@@ -3633,7 +3798,7 @@ async def run_agent(
         system_messages.append(_build_evomap_first_system_message())
         if session is not None and session_manager is not None:
             session.metadata["evomap_phase"] = "editing"
-            await session_manager._store.update_session_field(  # noqa: SLF001
+            await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                 session.id,
                 metadata=session.metadata,
             )
@@ -3742,7 +3907,7 @@ async def run_agent(
         _t_group_start = _time.monotonic()
         try:
             conversation_for_compress = conversation
-            if isinstance(session.metadata, dict):
+            if isinstance(session.metadata, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
                 raw_cutoff = session.metadata.get("compression_resume_message_index")
                 if isinstance(raw_cutoff, int) and raw_cutoff > 0:
                     cutoff = max(0, min(raw_cutoff, len(conversation) - 1))
@@ -4016,6 +4181,41 @@ async def run_agent(
             tools=[tc.name for tc in tool_calls],
         )
 
+        # Pre-flight: run evomap_fetch first; if it fails, silently remove it
+        # so the LLM never sees the failed call — it just proceeds normally.
+        _evomap_preflight_results: dict[str, tuple[str, ToolResult]] = {}
+        _evomap_failed_ids: set[str] = set()
+        for _pf_tc in tool_calls:
+            if _pf_tc.name != "evomap_fetch":
+                continue
+            _pf_id, _pf_result = await _execute_tool(
+                registry,
+                _pf_tc,
+                evomap_enabled=evomap_allowed_for_turn,
+                browser_allowed=True,
+                office_block_bash_probe=False,
+                office_block_message="",
+                office_edit_only=False,
+                office_edit_path="",
+                on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
+            )
+            if not _pf_result.success:
+                log.info(
+                    "agent.evomap_fetch_failed_fallback",
+                    session_id=session_id,
+                    error=_pf_result.error or _pf_result.output,
+                )
+                _evomap_failed_ids.add(_pf_tc.id)
+            else:
+                _evomap_preflight_results[_pf_tc.id] = (_pf_id, _pf_result)
+
+        if _evomap_failed_ids:
+            tool_calls = [tc for tc in tool_calls if tc.id not in _evomap_failed_ids]
+
+        if not tool_calls:
+            break
+
         tool_names_str = ", ".join(tc.name for tc in tool_calls)
         assistant_content = response.content or ""
         assistant_persist = (
@@ -4043,7 +4243,6 @@ async def run_agent(
                 _tool.current_session_id = session_id  # type: ignore[union-attr]
 
         stop_for_evomap_choice = False
-        stop_for_evomap_failure = False
         stop_for_probe_loop = False
         for tc in tool_calls:
             if tc.name == "file_write" and isinstance(tc.arguments.get("content"), str):
@@ -4067,18 +4266,21 @@ async def run_agent(
                             session_id=session_id,
                         )
 
-            tc_id, result = await _execute_tool(
-                registry,
-                tc,
-                evomap_enabled=evomap_allowed_for_turn,
-                browser_allowed=not browser_locked_by_evomap,
-                office_block_bash_probe=office_block_bash_probe,
-                office_block_message=office_block_message,
-                office_edit_only=office_edit_only,
-                office_edit_path=office_edit_path,
-                on_tool_call=on_tool_call,
-                on_tool_result=on_tool_result,
-            )
+            if tc.id in _evomap_preflight_results:
+                tc_id, result = _evomap_preflight_results[tc.id]
+            else:
+                tc_id, result = await _execute_tool(
+                    registry,
+                    tc,
+                    evomap_enabled=evomap_allowed_for_turn,
+                    browser_allowed=not browser_locked_by_evomap,
+                    office_block_bash_probe=office_block_bash_probe,
+                    office_block_message=office_block_message,
+                    office_edit_only=office_edit_only,
+                    office_edit_path=office_edit_path,
+                    on_tool_call=on_tool_call,
+                    on_tool_result=on_tool_result,
+                )
             if (
                 tc.name == "ppt_edit"
                 and result.success
@@ -4097,15 +4299,7 @@ async def run_agent(
                         output=result.output,
                         error="用户要求修改黑色横条，仅设置背景不算完成，请继续定向修改该横条",
                     )
-            if tc.name == "evomap_fetch":
-                if not result.success:
-                    final_text_parts.append(
-                        "EvoMap 方案检索失败，降级执行。\n"
-                        "information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/503\n"
-                        "如果你同意我继续，请回复：同意。"
-                    )
-                    stop_for_evomap_failure = True
-                    break
+            if tc.name == "evomap_fetch" and result.success:
                 candidates = _parse_evomap_fetch_candidates(result.output or "")
                 if len(candidates) > 3 and session is not None:
                     top3 = _pick_top_evomap_candidates(llm_message, candidates, limit=3)
@@ -4114,7 +4308,7 @@ async def run_agent(
                         "options": [{"asset_id": aid, "summary": summary} for aid, summary in top3],
                     }
                     if session_manager is not None:
-                        await session_manager._store.update_session_field(  # noqa: SLF001
+                        await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                             session.id,
                             metadata=session.metadata,
                         )
@@ -4286,18 +4480,16 @@ async def run_agent(
 
         if stop_for_evomap_choice:
             break
-        if stop_for_evomap_failure:
-            break
         if stop_for_probe_loop:
             break
         if metadata_dirty and session is not None and session_manager is not None:
-            await session_manager._store.update_session_field(  # noqa: SLF001
+            await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                 session.id,
                 metadata=session.metadata,
             )
             metadata_dirty = False
 
-        sig_parts = []
+        sig_parts: list[str] = []
         for tc in tool_calls:
             arg_str = json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)[:200]
             sig_parts.append(f"{tc.name}:{arg_str}")
@@ -4335,7 +4527,7 @@ async def run_agent(
     final_text = "".join(final_text_parts)
     final_text = _fix_image_paths(final_text, real_image_paths)
 
-    if locked_skill_ids and skill_announce_pending:
+    if lock_is_explicit and locked_skill_ids and skill_announce_pending:
         announce = _skill_announcement(locked_skill_ids, previous_locked_skill_ids)
         final_text = f"{announce}\n\n{final_text}" if final_text else announce
         skill_announce_pending = False
@@ -4343,9 +4535,29 @@ async def run_agent(
             session.metadata["skill_lock_announce_pending"] = False
             metadata_dirty = True
 
-    # Locked skill sessions require explicit user confirmation to release.
+    _lock_confirm_tip = (
+        "如果本轮任务已完成，请回复“任务完成”以解除技能锁定；"
+        "若需继续修改，请直接继续说需求。"
+    )
+
+    # Deferred lock: first run completed with auto-routed skills -> lock them now.
     if (
-        locked_skill_ids
+        not lock_is_explicit
+        and pending_lock_skill_ids
+        and session is not None
+        and successful_tool_calls > 0
+    ):
+        locked_skill_ids = pending_lock_skill_ids
+        lock_is_explicit = True
+        session.metadata["locked_skill_ids"] = locked_skill_ids
+        session.metadata["skill_lock_waiting_done"] = True
+        metadata_dirty = True
+        final_text = f"{final_text}\n\n{_lock_confirm_tip}" if final_text else _lock_confirm_tip
+
+    # Explicit lock: require user confirmation to release after successful tool use.
+    elif (
+        lock_is_explicit
+        and locked_skill_ids
         and session is not None
         and successful_tool_calls > 0
         and not lock_waiting_done
@@ -4353,14 +4565,10 @@ async def run_agent(
         session.metadata["locked_skill_ids"] = locked_skill_ids
         session.metadata["skill_lock_waiting_done"] = True
         metadata_dirty = True
-        confirm_tip = (
-            "如果本轮任务已完成，请回复“任务完成”以解除技能锁定；"
-            "若需继续修改，请直接继续说需求。"
-        )
-        final_text = f"{final_text}\n\n{confirm_tip}" if final_text else confirm_tip
+        final_text = f"{final_text}\n\n{_lock_confirm_tip}" if final_text else _lock_confirm_tip
 
     if metadata_dirty and session is not None and session_manager is not None:
-        await session_manager._store.update_session_field(  # noqa: SLF001
+        await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
             session.id,
             metadata=session.metadata,
         )
@@ -4385,7 +4593,7 @@ async def run_agent(
 
             if len(to_compress) >= 8:
                 compress_msgs = [
-                    Message(role=r.role if r.role != "tool" else "assistant", content=r.content)
+                    Message(role=r.role if r.role != "tool" else "assistant", content=r.content)  # pyright: ignore[reportArgumentType]
                     for r in to_compress
                 ]
                 start_id = to_compress[0].id

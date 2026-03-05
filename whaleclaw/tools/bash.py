@@ -93,6 +93,9 @@ class BashTool(Tool):
         err = stderr.decode(errors="replace")[:_MAX_OUTPUT]
         exit_code = proc.returncode or 0
 
+        if exit_code == 0:
+            _postprocess_delivery_files(out, command)
+
         output = out
         if err:
             output += f"\n[stderr]\n{err}"
@@ -103,3 +106,57 @@ class BashTool(Tool):
             output=output.strip(),
             error=err if exit_code != 0 else None,
         )
+
+
+_DELIVERY_PATH_RE = re.compile(
+    r"(/[^\s:\"'<>|]+\.(?:pptx|docx|html?))\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_POSTPROCESS_RECENCY_SEC = 30
+_POSTPROCESS_SUFFIXES = {".pptx", ".docx", ".html", ".htm"}
+
+
+def _postprocess_delivery_files(output: str, command: str = "") -> None:
+    """Auto-fix generated delivery files after a successful bash run.
+
+    Supported: .pptx (face crop + Z-order), .docx (face crop), .html (object-fit).
+
+    Sources (deduplicated):
+      1. Paths found in stdout
+      2. Paths found in the command text itself
+      3. Recently modified files in /tmp (within last 30s)
+    """
+    import time
+
+    candidates: set[str] = set()
+
+    for text in (output, command):
+        for m in _DELIVERY_PATH_RE.finditer(text):
+            candidates.add(m.group(1))
+
+    cutoff = time.time() - _POSTPROCESS_RECENCY_SEC
+    try:
+        for p in Path("/tmp").iterdir():
+            if p.suffix.lower() in _POSTPROCESS_SUFFIXES and p.stat().st_mtime >= cutoff:
+                candidates.add(str(p))
+    except Exception:
+        pass
+
+    for c in candidates:
+        p = Path(c)
+        if not p.exists():
+            continue
+        suffix = p.suffix.lower()
+        try:
+            if suffix == ".pptx":
+                from whaleclaw.utils.pptx_postprocess import fix_pptx
+                fix_pptx(p)
+            elif suffix == ".docx":
+                from whaleclaw.utils.docx_postprocess import fix_docx
+                fix_docx(p)
+            elif suffix in (".html", ".htm"):
+                from whaleclaw.utils.html_postprocess import fix_html
+                fix_html(p)
+        except Exception:
+            pass

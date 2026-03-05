@@ -388,6 +388,9 @@ class BrowserTool(Tool):
 
         import httpx
 
+        _MIN_IMAGE_BYTES = 50 * 1024  # prefer images >= 50 KB
+        best_fallback: tuple[Path, int] | None = None
+
         for url in img_urls:
             try:
                 async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -412,21 +415,41 @@ class BrowserTool(Tool):
                     ).strip("_") or "image"
                     filename = f"{safe_name}_{uuid.uuid4().hex[:8]}.{ext}"
                     path = _DOWNLOAD_DIR / filename
-                    path.write_bytes(resp.content)
+                    data = resp.content
+                    path.write_bytes(data)
 
-                    size_kb = len(resp.content) / 1024
-                    return ToolResult(
-                        success=True,
-                        output=(
-                            f"搜索词: {query}\n"
-                            f"图片已下载，请使用以下路径展示（禁止修改或编造路径）:\n"
-                            f"![图片]({path})\n"
-                            f"文件: {path}\n"
-                            f"大小: {size_kb:.0f}KB"
-                        ),
-                    )
+                    if len(data) >= _MIN_IMAGE_BYTES:
+                        size_kb = len(data) / 1024
+                        return ToolResult(
+                            success=True,
+                            output=(
+                                f"搜索词: {query}\n"
+                                f"图片已下载，请使用以下路径展示（禁止修改或编造路径）:\n"
+                                f"![图片]({path})\n"
+                                f"文件: {path}\n"
+                                f"大小: {size_kb:.0f}KB"
+                            ),
+                        )
+                    if best_fallback is None or len(data) > best_fallback[1]:
+                        best_fallback = (path, len(data))
+                    else:
+                        path.unlink(missing_ok=True)
             except Exception:
                 continue
+
+        if best_fallback is not None:
+            fb_path, fb_size = best_fallback
+            size_kb = fb_size / 1024
+            return ToolResult(
+                success=True,
+                output=(
+                    f"搜索词: {query}\n"
+                    f"图片已下载（未找到更大图片），请使用以下路径展示（禁止修改或编造路径）:\n"
+                    f"![图片]({fb_path})\n"
+                    f"文件: {fb_path}\n"
+                    f"大小: {size_kb:.0f}KB"
+                ),
+            )
 
         return ToolResult(
             success=False,

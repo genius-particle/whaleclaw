@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import re
 from pathlib import Path
+from typing import Any, cast
 
 import yaml
 from pydantic import BaseModel, Field
@@ -104,6 +105,10 @@ def _make_param_item_from_keyword(keyword: str, *, required: bool) -> SkillParam
     return None
 
 
+_PARAM_HINT_KEYWORDS = ("最小必填", "必填", "确认参数", "缺啥补啥", "缺少参数")
+_PARAM_HINT_EXCLUDE = ("必须遵守", "必须使用", "必须包含", "必须保持", "必须在", "命令行参数")
+
+
 def _infer_param_guard_from_instructions(instructions: str) -> SkillParamGuard | None:
     lines = [ln.strip() for ln in instructions.splitlines() if ln.strip()]
     if not lines:
@@ -112,7 +117,9 @@ def _infer_param_guard_from_instructions(instructions: str) -> SkillParamGuard |
     seen: set[str] = set()
     for line in lines:
         line_l = line.lower()
-        is_hint_line = any(x in line_l for x in ("最小必填", "必填", "可选", "缺", "参数"))
+        if any(ex in line_l for ex in _PARAM_HINT_EXCLUDE):
+            continue
+        is_hint_line = any(x in line_l for x in _PARAM_HINT_KEYWORDS)
         if not is_hint_line:
             continue
         required = not any(x in line_l for x in ("可选", "非必填", "选填"))
@@ -135,34 +142,41 @@ class SkillParser:
         """Parse SKILL.md file into Skill model."""
         raw = path.read_text(encoding="utf-8")
         body = raw
-        frontmatter: dict[str, object] = {}
+        frontmatter: dict[str, Any] = {}
 
         fm_match = _FRONTMATTER_RE.match(raw)
         if fm_match:
             with contextlib.suppress(yaml.YAMLError):
-                frontmatter = yaml.safe_load(fm_match.group(1)) or {}
+                loaded: Any = yaml.safe_load(fm_match.group(1))
+                if isinstance(loaded, dict):
+                    frontmatter = cast(dict[str, Any], loaded)
             body = raw[fm_match.end() :]
 
-        triggers = list(frontmatter.get("triggers") or [])
-        if isinstance(triggers, str):
-            triggers = [triggers]
-        max_tokens = int(frontmatter.get("max_tokens", 800))
+        raw_triggers: Any = frontmatter.get("triggers") or []
+        if isinstance(raw_triggers, str):
+            triggers: list[str] = [raw_triggers]
+        elif isinstance(raw_triggers, list):
+            triggers = [str(t) for t in cast(list[Any], raw_triggers)]
+        else:
+            triggers = []
+        max_tokens = int(frontmatter.get("max_tokens") or 800)
         lock_session = bool(
             frontmatter.get("lock_session", frontmatter.get("conversation_lock", False))
         )
         param_guard: SkillParamGuard | None = None
-        guard_raw = frontmatter.get("param_guard")
+        guard_raw: Any = frontmatter.get("param_guard")
         if isinstance(guard_raw, dict):
-            params_raw = guard_raw.get("params")
+            typed_guard = cast(dict[str, Any], guard_raw)
+            params_raw: Any = typed_guard.get("params")
             items: list[SkillParamItem] = []
             if isinstance(params_raw, list):
-                for p in params_raw:
-                    if isinstance(p, dict) and p.get("key"):
+                for p in cast(list[Any], params_raw):
+                    if isinstance(p, dict) and cast(dict[str, Any], p).get("key"):
                         with contextlib.suppress(Exception):
                             items.append(SkillParamItem.model_validate(p))
             if items:
                 param_guard = SkillParamGuard(
-                    enabled=bool(guard_raw.get("enabled", True)),
+                    enabled=bool(typed_guard.get("enabled", True)),
                     params=items,
                 )
 

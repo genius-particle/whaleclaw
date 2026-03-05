@@ -24,6 +24,7 @@ from whaleclaw.gateway.protocol import (
     make_tool_call,
     make_tool_result,
 )
+from whaleclaw.gateway.task_registry import task_registry
 from whaleclaw.plugins.evomap.bridge import build_memory_hint_from_hook_data
 from whaleclaw.plugins.hooks import HookContext, HookManager, HookPoint
 from whaleclaw.providers.base import ImageContent
@@ -55,6 +56,31 @@ def _is_multi_agent_effective_for_session(
     if isinstance(metadata.get("multi_agent_enabled"), bool):
         return bool(metadata["multi_agent_enabled"])
     return global_enabled
+
+
+def _should_run_multi_agent_in_background(
+    config: WhaleclawConfig,
+    session: Session,
+    user_message: str,
+) -> bool:
+    """True only when multi-Agent is enabled AND this message will trigger execution (not discussion)."""
+    if not _is_multi_agent_effective_for_session(config, session):
+        return False
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    state = str(metadata.get("multi_agent_state", "")).strip().lower()
+    waiting = state == "confirm" or (
+        state == "" and bool(metadata.get("multi_agent_waiting_confirm", False))
+    )
+    msg = user_message.strip()
+    from whaleclaw.agent.loop import (
+        _is_multi_agent_confirm,  # pyright: ignore[reportPrivateUsage]
+        _is_multi_agent_discuss_done,  # pyright: ignore[reportPrivateUsage]
+    )
+    if state == "discuss" and _is_multi_agent_discuss_done(msg):
+        return True
+    if waiting and _is_multi_agent_confirm(msg):
+        return True
+    return False
 
 
 async def push_to_session(session_id: str, msg: WSMessage) -> bool:
@@ -141,6 +167,32 @@ async def websocket_handler(
 
     log.debug("ws.connected", conn_key=conn_key)
 
+    # ---- helpers to build a WS sink from the current connection ----
+
+    def _make_sink(ws: WebSocket) -> Callable[[WSMessage], Any]:
+        async def _sink(msg: WSMessage) -> bool:
+            return await _safe_send(ws, msg)
+        return _sink
+
+    # ---- reconnection: attach to a running background task ----
+
+    async def _try_attach_running_task(sid: str) -> bool:
+        """If a background task is running for *sid*, attach this WS and return True."""
+        if not task_registry.has_running(sid):
+            entry = task_registry.get(sid)
+            if entry is not None and not entry.is_alive and entry.final_result:
+                await _safe_send(websocket, make_message(sid, entry.final_result))
+                return True
+            return False
+        attached = await task_registry.attach(sid, _make_sink(websocket))
+        if attached:
+            log.info("ws.reattached_running_task", session_id=sid)
+            await _safe_send(
+                websocket,
+                make_status(sid, "已重新连接到正在执行的多Agent任务，继续接收结果…"),
+            )
+        return attached
+
     async def _reader() -> None:
         """Read WS messages and dispatch: ping handled inline, others queued."""
         nonlocal ws_alive
@@ -158,6 +210,10 @@ async def websocket_handler(
                 if incoming.type == MessageType.PING:
                     log.debug("ws.ping", session_id=incoming.session_id)
                     await _safe_send(websocket, make_pong())
+                    if incoming.session_id and session is None:
+                        loaded = await session_manager.get(incoming.session_id)
+                        if loaded:
+                            await _try_attach_running_task(loaded.id)
                     continue
 
                 log.debug(
@@ -188,16 +244,26 @@ async def websocket_handler(
     async def _processor() -> None:
         """Process queued user messages (run agent, send replies)."""
         nonlocal session
-        while ws_alive:
+        while True:
             try:
                 incoming = await asyncio.wait_for(inbox.get(), timeout=1.0)
             except TimeoutError:
+                if not ws_alive and inbox.empty():
+                    break
                 continue
 
             session = await _resolve_session(
                 incoming.session_id, session, session_manager,
             )
             _active_connections[session.id] = websocket
+
+            # If a background task is already running for this session, skip.
+            if task_registry.has_running(session.id):
+                await _safe_send(
+                    websocket,
+                    make_status(session.id, "多Agent任务正在执行中，请等待完成…"),
+                )
+                continue
 
             if (
                 compression_ready_fn is not None
@@ -252,60 +318,226 @@ async def websocket_handler(
 
             sid = session.id
             current_session = session
+            run_in_background = _should_run_multi_agent_in_background(
+                config, session, content or "",
+            )
 
-            async def on_stream(chunk: str, _sid: str = sid) -> None:
-                if ws_alive:
-                    await _safe_send(websocket, make_stream(_sid, chunk))
+            if run_in_background:
+                await _run_multi_agent_background(
+                    session=current_session,
+                    sid=sid,
+                    content=content,
+                    images=images,
+                    incoming=incoming,
+                    config=config,
+                    router=router,
+                    registry=registry,
+                    session_manager=session_manager,
+                    session_store=_store,
+                    memory_manager=memory_manager,
+                    hook_manager=hook_manager,
+                    group_compressor=group_compressor,
+                    websocket=websocket,
+                )
+            else:
+                await _run_single_agent_inline(
+                    session=current_session,
+                    sid=sid,
+                    content=content,
+                    images=images,
+                    incoming=incoming,
+                    config=config,
+                    router=router,
+                    registry=registry,
+                    session_manager=session_manager,
+                    session_store=_store,
+                    memory_manager=memory_manager,
+                    hook_manager=hook_manager,
+                    group_compressor=group_compressor,
+                    websocket=websocket,
+                    ws_alive_fn=lambda: ws_alive,
+                )
 
-            async def on_tool_call(
-                name: str,
-                arguments: dict[str, Any],
-                _sid: str = sid,
-            ) -> None:
-                if ws_alive:
-                    await _safe_send(websocket, make_tool_call(_sid, name, arguments))
+    # ---- inline single-agent execution (original behaviour) ----
 
-            async def on_tool_result_cb(
-                name: str,
-                result: ToolResult,
-                _sid: str = sid,
-            ) -> None:
-                if ws_alive:
-                    await _safe_send(
-                        websocket,
-                        make_tool_result(_sid, name, result.output, result.success),
-                    )
+    async def _run_single_agent_inline(
+        *,
+        session: Session,
+        sid: str,
+        content: str,
+        images: list[ImageContent],
+        incoming: WSMessage,
+        config: WhaleclawConfig,
+        router: ModelRouter,
+        registry: ToolRegistry,
+        session_manager: SessionManager,
+        session_store: Any,
+        memory_manager: MemoryManager | None,
+        hook_manager: HookManager | None,
+        group_compressor: SessionGroupCompressor | None,
+        websocket: WebSocket,
+        ws_alive_fn: Callable[[], bool],
+    ) -> None:
+        async def on_stream(chunk: str, _sid: str = sid) -> None:
+            if ws_alive_fn():
+                await _safe_send(websocket, make_stream(_sid, chunk))
 
-            async def on_round_result_cb(
-                round_no: int,
-                content_text: str,
-                _sid: str = sid,
-                _session: Session = current_session,
-            ) -> None:
-                if not ws_alive:
+        async def on_tool_call_cb(
+            name: str,
+            arguments: dict[str, Any],
+            _sid: str = sid,
+        ) -> None:
+            if ws_alive_fn():
+                await _safe_send(websocket, make_tool_call(_sid, name, arguments))
+
+        async def on_tool_result_cb(
+            name: str,
+            result: ToolResult,
+            _sid: str = sid,
+        ) -> None:
+            if ws_alive_fn():
+                await _safe_send(
+                    websocket,
+                    make_tool_result(_sid, name, result.output, result.success),
+                )
+
+        async def on_round_result_cb(
+            round_no: int,
+            content_text: str,
+            _sid: str = sid,
+            _session: Session = session,
+        ) -> None:
+            if not ws_alive_fn():
+                return
+            round_msg = f"第 {round_no} 轮交付\n\n{content_text}".strip()
+            await session_manager.add_message(_session, "assistant", round_msg)
+            await _safe_send(websocket, make_message(_sid, round_msg))
+
+        try:
+            extra_memory = ""
+            if hook_manager is not None:
+                hook_out = await hook_manager.run(
+                    HookPoint.BEFORE_MESSAGE,
+                    HookContext(
+                        hook=HookPoint.BEFORE_MESSAGE,
+                        session_id=session.id,
+                        data={
+                            "message": content,
+                            "channel": "webchat",
+                        },
+                    ),
+                )
+                if not hook_out.proceed:
+                    await _safe_send(websocket, make_message(session.id, "消息被策略阻止。"))
                     return
-                round_msg = f"第 {round_no} 轮交付\n\n{content_text}".strip()
-                await session_manager.add_message(_session, "assistant", round_msg)
-                await _safe_send(websocket, make_message(_sid, round_msg))
-
-            try:
-                extra_memory = ""
-                if hook_manager is not None:
-                    hook_out = await hook_manager.run(
-                        HookPoint.BEFORE_MESSAGE,
+                extra_memory = build_memory_hint_from_hook_data(hook_out.data)
+            reply = await run_agent(
+                message=content or "(用户发送了图片)",
+                session_id=session.id,
+                config=config,
+                on_stream=on_stream,
+                session=session,
+                router=router,
+                registry=registry,
+                on_tool_call=on_tool_call_cb,
+                on_tool_result=on_tool_result_cb,
+                on_round_result=on_round_result_cb,
+                images=images or None,
+                session_manager=session_manager,
+                session_store=session_store,
+                memory_manager=memory_manager,
+                extra_memory=extra_memory,
+                trigger_event_id=incoming.id,
+                trigger_text_preview=content or "(用户发送了图片)",
+                group_compressor=group_compressor,
+            )
+            if reply.strip():
+                await session_manager.add_message(session, "assistant", reply)
+                await _safe_send(websocket, make_message(session.id, reply))
+        except Exception as exc:
+            if hook_manager is not None:
+                with suppress(Exception):
+                    await hook_manager.run(
+                        HookPoint.ON_ERROR,
                         HookContext(
-                            hook=HookPoint.BEFORE_MESSAGE,
+                            hook=HookPoint.ON_ERROR,
                             session_id=session.id,
                             data={
+                                "error": str(exc),
                                 "message": content,
                                 "channel": "webchat",
                             },
                         ),
                     )
-                    if not hook_out.proceed:
-                        await _safe_send(websocket, make_message(session.id, "消息被策略阻止。"))
-                        continue
-                    extra_memory = build_memory_hint_from_hook_data(hook_out.data)
+            log.error("agent.error", error=str(exc), session_id=session.id)
+            await _safe_send(
+                websocket, make_error(session.id, f"Agent 处理失败: {exc}"),
+            )
+
+    # ---- background multi-Agent execution ----
+
+    async def _run_multi_agent_background(
+        *,
+        session: Session,
+        sid: str,
+        content: str,
+        images: list[ImageContent],
+        incoming: WSMessage,
+        config: WhaleclawConfig,
+        router: ModelRouter,
+        registry: ToolRegistry,
+        session_manager: SessionManager,
+        session_store: Any,
+        memory_manager: MemoryManager | None,
+        hook_manager: HookManager | None,
+        group_compressor: SessionGroupCompressor | None,
+        websocket: WebSocket,
+    ) -> None:
+        """Launch the multi-Agent task in the background via TaskRegistry."""
+
+        extra_memory = ""
+        if hook_manager is not None:
+            try:
+                hook_out = await hook_manager.run(
+                    HookPoint.BEFORE_MESSAGE,
+                    HookContext(
+                        hook=HookPoint.BEFORE_MESSAGE,
+                        session_id=session.id,
+                        data={"message": content, "channel": "webchat"},
+                    ),
+                )
+                if not hook_out.proceed:
+                    await _safe_send(websocket, make_message(session.id, "消息被策略阻止。"))
+                    return
+                extra_memory = build_memory_hint_from_hook_data(hook_out.data)
+            except Exception as exc:
+                log.warning("ws.hook_before_message_failed", error=str(exc))
+
+        async def _bg_run_agent() -> str:
+            """The actual coroutine that runs in the background task."""
+            entry = task_registry.get(sid)
+
+            async def on_stream(chunk: str) -> None:
+                if entry:
+                    await entry.emit(make_stream(sid, chunk))
+
+            async def on_tool_call_bg(name: str, arguments: dict[str, Any]) -> None:
+                if entry:
+                    await entry.emit(make_tool_call(sid, name, arguments))
+
+            async def on_tool_result_bg(name: str, result: ToolResult) -> None:
+                if entry:
+                    await entry.emit(
+                        make_tool_result(sid, name, result.output, result.success)
+                    )
+
+            async def on_round_result_bg(round_no: int, content_text: str) -> None:
+                round_msg = f"第 {round_no} 轮交付\n\n{content_text}".strip()
+                await session_manager.add_message(session, "assistant", round_msg)
+                if entry:
+                    await entry.emit(make_message(sid, round_msg))
+
+            try:
                 reply = await run_agent(
                     message=content or "(用户发送了图片)",
                     session_id=session.id,
@@ -314,12 +546,12 @@ async def websocket_handler(
                     session=session,
                     router=router,
                     registry=registry,
-                    on_tool_call=on_tool_call,
-                    on_tool_result=on_tool_result_cb,
-                    on_round_result=on_round_result_cb,
+                    on_tool_call=on_tool_call_bg,
+                    on_tool_result=on_tool_result_bg,
+                    on_round_result=on_round_result_bg,
                     images=images or None,
                     session_manager=session_manager,
-                    session_store=_store,
+                    session_store=session_store,
                     memory_manager=memory_manager,
                     extra_memory=extra_memory,
                     trigger_event_id=incoming.id,
@@ -328,8 +560,17 @@ async def websocket_handler(
                 )
                 if reply.strip():
                     await session_manager.add_message(session, "assistant", reply)
-                    await _safe_send(websocket, make_message(session.id, reply))
+                    if entry:
+                        await entry.emit(make_message(sid, reply))
+                return reply
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
+                log.error("agent.bg_error", error=str(exc), session_id=session.id)
+                if entry:
+                    await entry.emit(
+                        make_error(session.id, f"多Agent任务执行失败: {exc}")
+                    )
                 if hook_manager is not None:
                     with suppress(Exception):
                         await hook_manager.run(
@@ -344,34 +585,41 @@ async def websocket_handler(
                                 },
                             ),
                         )
-                log.error(
-                    "agent.error",
-                    error=str(exc),
-                    session_id=session.id,
-                )
-                await _safe_send(
-                    websocket, make_error(session.id, f"Agent 处理失败: {exc}"),
-                )
+                return f"多Agent任务执行失败: {exc}"
+
+        entry = task_registry.launch(sid, _bg_run_agent())
+        await entry.attach(_make_sink(websocket))
+        await _safe_send(
+            websocket,
+            make_status(sid, "多Agent任务执行中…"),
+        )
+
+    # ---- lifecycle ----
 
     reader_task = asyncio.create_task(_reader())
     processor_task = asyncio.create_task(_processor())
 
     try:
-        done, pending = await asyncio.wait(
-            [reader_task, processor_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        ws_alive = False
-        for t in pending:
-            t.cancel()
-        for t in done:
-            if t.exception() and not isinstance(t.exception(), asyncio.CancelledError):
-                log.error("ws.task_error", error=str(t.exception()))
-    except Exception:
-        ws_alive = False
-        reader_task.cancel()
-        processor_task.cancel()
+        await reader_task
+    except Exception as exc:
+        if not isinstance(exc, asyncio.CancelledError):
+            log.error("ws.reader_error", error=str(exc))
     finally:
-        _active_connections.pop(conn_key, None)
-        if session:
-            _active_connections.pop(session.id, None)
+        ws_alive = False
+
+    # Let _processor drain any remaining inbox messages before shutting down.
+    try:
+        await asyncio.wait_for(processor_task, timeout=300)
+    except TimeoutError:
+        log.warning("ws.processor_drain_timeout", session_id=session.id if session else "(none)")
+        processor_task.cancel()
+    except Exception as exc:
+        if not isinstance(exc, asyncio.CancelledError):
+            log.error("ws.processor_error", error=str(exc))
+
+    # Detach from any running background task (don't cancel it).
+    if session is not None:
+        await task_registry.detach(session.id)
+    _active_connections.pop(conn_key, None)
+    if session:
+        _active_connections.pop(session.id, None)

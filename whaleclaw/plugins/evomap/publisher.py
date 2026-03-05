@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import platform
-from typing import Literal
+from typing import Any, Literal
 
 from whaleclaw.plugins.evomap.client import A2AClient
 from whaleclaw.plugins.evomap.hasher import AssetHasher
@@ -43,7 +43,7 @@ class AssetPublisher:
         arch = "arm64" if platform.machine() in ("arm64", "aarch64") else "x64"
         env = EnvFingerprint(platform=platform.system().lower(), arch=arch)
 
-        gene_raw = Gene(
+        gene_raw: dict[str, Any] = Gene(
             category=category,
             signals_match=signals,
             summary=gene_summary,
@@ -51,7 +51,7 @@ class AssetPublisher:
         gene_id = AssetHasher.compute_asset_id(gene_raw)
         gene_raw["asset_id"] = gene_id
 
-        capsule_raw = Capsule(
+        capsule_raw: dict[str, Any] = Capsule(
             trigger=signals,
             gene=gene_id,
             summary=capsule_summary,
@@ -63,7 +63,7 @@ class AssetPublisher:
         capsule_id = AssetHasher.compute_asset_id(capsule_raw)
         capsule_raw["asset_id"] = capsule_id
 
-        event_raw = EvolutionEvent(
+        event_raw: dict[str, Any] = EvolutionEvent(
             intent=category,
             capsule_id=capsule_id,
             genes_used=[gene_id],

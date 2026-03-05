@@ -9,6 +9,64 @@ from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
 from whaleclaw.tools.deps import ensure_tool_dep
 
 
+def _add_cropped_picture(
+    slide: Any,
+    img_path: Path,
+    left: int,
+    top: int,
+    target_w: int,
+    target_h: int,
+) -> Any:
+    """Add a picture to *slide* with smart face-aware cropping.
+
+    Returns the created picture shape, or None if fallback (no PIL) was used.
+    """
+    try:
+        from PIL import Image as PILImage
+        from whaleclaw.utils.image_crop import detect_face_info, smart_crop_box
+
+        with PILImage.open(str(img_path)) as im:
+            iw, ih = im.size
+
+        fi = detect_face_info(str(img_path))
+        crop_box = smart_crop_box(iw, ih, iw, int(iw * target_h / target_w), face_info=fi)
+        cx0, cy0, cx1, cy1 = crop_box
+
+        crop_left_frac = cx0 / iw
+        crop_right_frac = 1.0 - cx1 / iw
+        crop_top_frac = cy0 / ih
+        crop_bottom_frac = 1.0 - cy1 / ih
+
+        img_ratio = iw / ih
+        box_ratio = target_w / target_h
+        if img_ratio > box_ratio:
+            scale_h = target_h
+            scale_w = int(target_h * img_ratio)
+        else:
+            scale_w = target_w
+            scale_h = int(target_w / img_ratio)
+
+        pic = slide.shapes.add_picture(
+            str(img_path),
+            int(left - (scale_w - target_w) / 2),
+            int(top - (scale_h - target_h) / 2),
+            int(scale_w),
+            int(scale_h),
+        )
+        pic.crop_left = crop_left_frac
+        pic.crop_right = crop_right_frac
+        pic.crop_top = crop_top_frac
+        pic.crop_bottom = crop_bottom_frac
+        pic.left = int(left)
+        pic.top = int(top)
+        pic.width = int(target_w)
+        pic.height = int(target_h)
+        return pic
+    except ImportError:
+        slide.shapes.add_picture(str(img_path), left, top, width=target_w)
+        return None
+
+
 class PptEditTool(Tool):
     """Edit an existing PPT by actions on a specific slide."""
 
@@ -17,7 +75,9 @@ class PptEditTool(Tool):
         return ToolDefinition(
             name="ppt_edit",
             description=(
-                "修改现有 PPT（.pptx）：支持文本替换、标题更新、商务风格、背景色、备注、插图。"
+                "修改现有 PPT（.pptx）：支持文本替换、标题更新、商务风格、背景色、备注、"
+                "插图（add_image 新增图片；replace_image 替换已有图片，保持原位置尺寸；"
+                "remove_image 删除图片）。换图/替换封面图请用 replace_image。"
             ),
             parameters=[
                 ToolParameter(name="path", type="string", description="PPT 文件绝对路径"),
@@ -26,7 +86,8 @@ class PptEditTool(Tool):
                     name="action",
                     type="string",
                     description=(
-                        "操作类型：replace_text|set_title|set_notes|set_background|add_image|apply_business_style"
+                        "操作类型：replace_text|set_title|set_notes|set_background"
+                        "|add_image|replace_image|remove_image|apply_business_style"
                     ),
                     required=False,
                     enum=[
@@ -35,8 +96,16 @@ class PptEditTool(Tool):
                         "set_notes",
                         "set_background",
                         "add_image",
+                        "replace_image",
+                        "remove_image",
                         "apply_business_style",
                     ],
+                ),
+                ToolParameter(
+                    name="image_index",
+                    type="integer",
+                    description="目标图片序号（从 1 开始，replace_image/remove_image 时使用，默认 1 即第一张图）",
+                    required=False,
                 ),
                 ToolParameter(
                     name="old_text",
@@ -72,6 +141,12 @@ class PptEditTool(Tool):
                     name="image_width",
                     type="number",
                     description="插图宽度（英寸，默认 6.5）",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="image_height",
+                    type="number",
+                    description="插图高度（英寸）。同时指定 width+height 时自动裁剪保持比例，不会变形拉伸。",
                     required=False,
                 ),
                 ToolParameter(
@@ -204,9 +279,55 @@ class PptEditTool(Tool):
                 return ToolResult(success=False, output="", error=f"图片不存在: {img}")
             left = Inches(float(kwargs.get("image_left", 1.0)))
             top = Inches(float(kwargs.get("image_top", 1.8)))
-            width = Inches(float(kwargs.get("image_width", 6.5)))
-            slide.shapes.add_picture(str(img), left, top, width=width)
+            target_w = Inches(float(kwargs.get("image_width", 6.5)))
+            raw_h = kwargs.get("image_height")
+            if raw_h is not None:
+                target_h = Inches(float(raw_h))
+                _add_cropped_picture(slide, img, int(left), int(top), int(target_w), int(target_h))
+            else:
+                slide.shapes.add_picture(str(img), left, top, width=target_w)
             output = f"已在 {path} 第 {slide_index} 页插入图片 {img.name}"
+        elif action in ("replace_image", "remove_image"):
+            image_shapes = [
+                s for s in slide.shapes
+                if s.shape_type == MSO_SHAPE_TYPE.PICTURE
+            ]
+            if not image_shapes:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"第 {slide_index} 页没有图片可操作",
+                )
+            try:
+                img_idx = int(kwargs.get("image_index", 1))
+            except (TypeError, ValueError):
+                img_idx = 1
+            if img_idx < 1 or img_idx > len(image_shapes):
+                return ToolResult(
+                    success=False, output="",
+                    error=f"image_index={img_idx} 越界，该页共 {len(image_shapes)} 张图片",
+                )
+            old_shape = image_shapes[img_idx - 1]
+            old_left, old_top = old_shape.left, old_shape.top
+            old_width, old_height = old_shape.width, old_shape.height
+
+            sp_elem = old_shape._element  # pyright: ignore[reportPrivateUsage]
+            sp_elem.getparent().remove(sp_elem)
+
+            if action == "remove_image":
+                output = f"已删除 {path} 第 {slide_index} 页第 {img_idx} 张图片"
+            else:
+                if not image_path:
+                    return ToolResult(
+                        success=False, output="",
+                        error="replace_image 需要 image_path",
+                    )
+                img = Path(image_path).expanduser().resolve()
+                if not img.is_file():
+                    return ToolResult(success=False, output="", error=f"图片不存在: {img}")
+                _add_cropped_picture(
+                    slide, img, old_left, old_top, old_width, old_height,
+                )
+                output = f"已替换 {path} 第 {slide_index} 页第 {img_idx} 张图片为 {img.name}"
         elif action == "apply_business_style":
             def _iter_shapes_recursive(container: Any) -> list[Any]:
                 items: list[Any] = []
@@ -262,6 +383,26 @@ class PptEditTool(Tool):
             )
         else:
             return ToolResult(success=False, output="", error=f"不支持的 action: {action}")
+
+        sw, sh = prs.slide_width, prs.slide_height
+        for s in slide.shapes:
+            overflow_r = s.left + s.width - sw
+            overflow_b = s.top + s.height - sh
+            if overflow_r > 0 or overflow_b > 0:
+                is_pic = getattr(s, "shape_type", None) == MSO_SHAPE_TYPE.PICTURE
+                if is_pic and s.width > 0 and s.height > 0:
+                    ratio = s.width / s.height
+                    if overflow_r > 0:
+                        s.width = sw - s.left
+                        s.height = int(s.width / ratio)
+                    if s.top + s.height > sh:
+                        s.height = sh - s.top
+                        s.width = int(s.height * ratio)
+                else:
+                    if overflow_r > 0:
+                        s.width = sw - s.left
+                    if overflow_b > 0:
+                        s.height = sh - s.top
 
         try:
             prs.save(str(path))

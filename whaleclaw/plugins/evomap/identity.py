@@ -23,7 +23,8 @@ class EvoMapIdentity:
             return self._data
         path = self._path
         if path.exists():
-            self._data = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self._data = raw if isinstance(raw, dict) else {}
         else:
             self._data = {}
         return self._data
@@ -56,4 +57,27 @@ class EvoMapIdentity:
         data = self._load()
         data["claim_code"] = code
         data["claim_url"] = url
+        self._save(data)
+
+    def get_node_secret(self) -> str | None:
+        """Get persisted node_secret from identity file."""
+        data = self._load()
+        secret = data.get("node_secret")
+        return str(secret) if secret is not None else None
+
+    def save_node_secret(self, secret: str) -> None:
+        """Persist node_secret obtained from hello response."""
+        data = self._load()
+        data["node_secret"] = secret
+        self._save(data)
+
+    def save_hello_response(self, payload: dict[str, str | int | None]) -> None:
+        """Persist key fields from hello response (node_secret, claim_code, claim_url)."""
+        data = self._load()
+        if payload.get("node_secret"):
+            data["node_secret"] = payload["node_secret"]
+        if payload.get("claim_code"):
+            data["claim_code"] = payload["claim_code"]
+        if payload.get("claim_url"):
+            data["claim_url"] = payload["claim_url"]
         self._save(data)
