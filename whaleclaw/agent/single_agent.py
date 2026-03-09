@@ -202,6 +202,14 @@ _IMAGE_REFERENCE_RE = re.compile(
     r"(这张图|这张图片|这幅图|这幅图片|图里|图中|参考图|按这张|基于这张|用这张)",
     re.IGNORECASE,
 )
+_IMAGE_EDIT_FOLLOWUP_RE = re.compile(
+    r"(改(?:成|下|一下)?|修改|调整|优化|增强|变得|变成|换成|把.+(?:改|变))",
+    re.IGNORECASE,
+)
+_IMAGE_REGENERATE_RE = re.compile(
+    r"(重试|重做|重新生成|重生成|重新来|再来一版|再生成一次|再试一次|重画|这图不好看)",
+    re.IGNORECASE,
+)
 _EVOMAP_LINE_RE = re.compile(r"^\s*-\s*([^:]+):\s*(.+?)\s*$")
 _VERSION_SUFFIX_RE = re.compile(r"_V\d+$", re.IGNORECASE)
 _COORDINATOR_ASK_RE = re.compile(
@@ -229,6 +237,7 @@ _USE_CMD_RE = re.compile(r"^\s*/use\s+([^\s]+)\s*(.*)$", re.IGNORECASE | re.DOTA
 _USE_CLEAR_IDS = {"clear", "none", "off", "default", "reset"}
 _TASK_DONE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*任务完成\s*$"),
+    re.compile(r"^\s*完成任务\s*$"),
     re.compile(r"^\s*完成了?\s*$"),
     re.compile(r"^\s*结束了?\s*$"),
     re.compile(r"^\s*可以了?\s*$"),
@@ -834,6 +843,18 @@ def _message_may_need_prior_images(message: str) -> bool:
     return bool(_IMAGE_REFERENCE_RE.search(message))
 
 
+def _message_requests_image_edit(message: str) -> bool:
+    """Detect edit follow-ups that should continue from the latest output image."""
+    if _message_may_need_prior_images(message):
+        return True
+    return bool(_IMAGE_EDIT_FOLLOWUP_RE.search(message))
+
+
+def _message_requests_image_regenerate(message: str) -> bool:
+    """Detect reruns that should go back to the original input image set."""
+    return bool(_IMAGE_REGENERATE_RE.search(message))
+
+
 def _skill_requires_images(skills: list[Skill]) -> bool:
     """Return whether any active skill explicitly requires image inputs."""
     for skill in skills:
@@ -879,6 +900,45 @@ def _recover_recent_session_images(
     return recovered
 
 
+def _load_images_from_paths(paths: list[str]) -> list[ImageContent]:
+    """Read local image paths into inline message payloads."""
+    recovered: list[ImageContent] = []
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        recovered.append(ImageContent(
+            mime=_mime_from_image_path(path),
+            data=base64.b64encode(data).decode("ascii"),
+        ))
+    return recovered
+
+
+def _recover_latest_generated_image(session: Session | None) -> list[ImageContent]:
+    """Return only the latest generated image for edit-followup turns."""
+    if session is None:
+        return []
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    latest_generated = str(metadata.get("last_generated_image_path", "")).strip()
+    if not latest_generated:
+        return []
+    return _load_images_from_paths([latest_generated])
+
+
+def _recover_last_input_images(session: Session | None) -> list[ImageContent]:
+    """Return the last explicit input image set for regenerate-followup turns."""
+    if session is None:
+        return []
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    raw_paths = metadata.get("last_input_image_paths", [])
+    if not isinstance(raw_paths, list):
+        return []
+    paths = [str(item).strip() for item in raw_paths if str(item).strip()]
+    return _load_images_from_paths(paths)
+
+
 def _recover_recent_session_image_paths(
     session: Session | None,
     *,
@@ -916,6 +976,28 @@ def _recover_recent_session_image_paths(
             if len(recovered) >= limit:
                 return recovered
     return recovered
+
+
+def _extract_input_image_paths_from_text(
+    text: str,
+    *,
+    limit: int = 8,
+) -> list[str]:
+    """Extract unique local image paths from the current user message text."""
+    extracted: list[str] = []
+    seen_paths: set[str] = set()
+    markdown_paths = [match.group(2).strip() for match in _IMG_MD_RE.finditer(text)]
+    plain_paths = [match.group(1).strip() for match in _ABS_IMAGE_PATH_RE.finditer(text)]
+    for raw_path in [*markdown_paths, *plain_paths]:
+        path = Path(raw_path).expanduser()
+        resolved = str(path)
+        if resolved in seen_paths or not path.is_file():
+            continue
+        seen_paths.add(resolved)
+        extracted.append(resolved)
+        if len(extracted) >= limit:
+            break
+    return extracted
 
 
 def _multi_agent_cfg(config: WhaleclawConfig) -> dict[str, object]:
@@ -1885,21 +1967,34 @@ async def run_agent(
             active_skills_for_images = _assembler.route_skills(
                 llm_message, forced_skill_ids=locked_skill_ids
             )
-        if (
-            not images
-            and (
-                _message_may_need_prior_images(llm_message)
-                or _skill_requires_images(active_skills_for_images)
-            )
-        ):
-            recovered_images = _recover_recent_session_images(session)
+        if not images:
+            recovered_images: list[ImageContent] = []
+            reuse_reason = ""
+            skill_needs_images = _skill_requires_images(active_skills_for_images)
+            if _message_requests_image_regenerate(llm_message):
+                recovered_images = _recover_last_input_images(session)
+                reuse_reason = "last_input_images"
+            elif _message_requests_image_edit(llm_message) and (
+                _message_may_need_prior_images(llm_message) or skill_needs_images
+            ):
+                recovered_images = _recover_latest_generated_image(session)
+                reuse_reason = "latest_generated_image"
+                if not recovered_images:
+                    recovered_images = _recover_last_input_images(session)
+                    reuse_reason = "last_input_images_fallback"
             if recovered_images:
                 images = recovered_images
                 log.info(
                     "agent.reused_recent_images",
                     session_id=session_id,
                     count=len(recovered_images),
+                    reason=reuse_reason,
                 )
+        elif session is not None:
+            current_input_paths = _extract_input_image_paths_from_text(llm_message)
+            if current_input_paths:
+                session.metadata["last_input_image_paths"] = current_input_paths
+                metadata_dirty = True
 
         if lock_is_explicit and locked_skill_ids and not lock_waiting_done and session is not None:
             locked_skills = _assembler.route_skills(llm_message, forced_skill_ids=locked_skill_ids)

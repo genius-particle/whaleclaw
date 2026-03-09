@@ -1484,7 +1484,7 @@ async def test_run_agent_skill_lock_requires_explicit_done_confirmation() -> Non
 
     router2 = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
     second = await run_agent(
-        message="任务完成",
+        message="完成任务",
         session_id=session.id,
         config=WhaleclawConfig(),
         router=router2,
@@ -2498,6 +2498,13 @@ async def test_run_agent_prefers_latest_generated_image_for_locked_image_skill(
         metadata={
             "locked_skill_ids": ["nano-banana-image-t8"],
             "last_generated_image_path": str(generated_path),
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "sk-test",
+                    "prompt": "让猫更有气势",
+                    "__model_display__": "香蕉2",
+                }
+            },
         },
     )
 
@@ -2513,6 +2520,183 @@ async def test_run_agent_prefers_latest_generated_image_for_locked_image_skill(
     assert any(images for images in seen_user_images)
     last_non_empty = next(images for images in reversed(seen_user_images) if images)
     assert base64.b64decode(last_non_empty[0].data) == b"generated-image"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_regenerate_reuses_last_input_image_set_for_locked_image_skill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["nanobanana"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(
+                    key="images",
+                    label="图片",
+                    type="images",
+                    required=True,
+                    prompt="请上传图片",
+                ),
+            ],
+        ),
+        source_path=Path("/tmp/nano_guard_regenerate.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    original_1 = tmp_path / "original-1.png"
+    original_1.write_bytes(b"original-1")
+    original_2 = tmp_path / "original-2.png"
+    original_2.write_bytes(b"original-2")
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+
+    seen_user_images: list[Any] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        for item in messages:
+            if getattr(item, "role", "") == "user":
+                seen_user_images.append(getattr(item, "images", None))
+        return AgentResponse(content="重新图生图", model="test-model")
+
+    router = _make_router(chat_fn=fake_chat)
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-guard-regenerate-1",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_input_image_paths": [str(original_1), str(original_2)],
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "sk-test",
+                    "prompt": "让图1和图2组合",
+                    "__model_display__": "香蕉2",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="这图不好看，重新生成下",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "重新图生图" in result
+    last_non_empty = next(images for images in reversed(seen_user_images) if images)
+    assert len(last_non_empty) == 2
+    assert base64.b64decode(last_non_empty[0].data) == b"original-1"
+    assert base64.b64decode(last_non_empty[1].data) == b"original-2"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_does_not_reuse_images_for_plain_chat_under_locked_image_skill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["nanobanana"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(
+                    key="images",
+                    label="图片",
+                    type="images",
+                    required=True,
+                    prompt="请上传图片",
+                ),
+            ],
+        ),
+        source_path=Path("/tmp/nano_guard_plain_chat.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    original_path = tmp_path / "original.png"
+    original_path.write_bytes(b"original-image")
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+
+    seen_user_images: list[Any] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        for item in messages:
+            if getattr(item, "role", "") == "user":
+                seen_user_images.append(getattr(item, "images", None))
+        return AgentResponse(content="讲个冷笑话", model="test-model")
+
+    router = _make_router(chat_fn=fake_chat)
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-guard-plain-chat-1",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_input_image_paths": [str(original_path)],
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "sk-test",
+                    "prompt": "生成一张猫图",
+                    "__model_display__": "香蕉2",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="讲个笑话",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "讲个冷笑话" in result
+    assert all(not images for images in seen_user_images)
 
 
 @pytest.mark.asyncio
