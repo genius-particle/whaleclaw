@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from whaleclaw.skills import clawhub
@@ -167,3 +168,91 @@ def test_enrich_results_skips_detail_when_sort_keys_are_ready(monkeypatch) -> No
     assert called == ["need-detail"]
     assert rows[0]["downloads"] == 7
     assert rows[1]["downloads"] == 2
+
+
+def test_publish_installed_skill_uses_http_publish_directly(
+    monkeypatch, tmp_path: Path
+) -> None:  # noqa: ANN001
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+
+    called: dict[str, object] = {}
+
+    def _fake_http_publish(**kwargs):  # noqa: ANN001
+        called.update(kwargs)
+        return "OK. Published demo-skill@1.0.1 (ver_123)"
+
+    monkeypatch.setattr(clawhub, "_publish_via_http", _fake_http_publish)
+
+    out = clawhub.publish_installed_skill(
+        skill_dir=skill_dir,
+        skill_slug="demo-skill",
+        skill_version="1.0.1",
+        registry_url="https://clawhub.ai",
+        workspace_dir=tmp_path,
+        api_token="token",
+    )
+
+    assert "OK. Published demo-skill@1.0.1" in out
+    assert called["skill_slug"] == "demo-skill"
+    assert called["skill_version"] == "1.0.1"
+
+
+def test_publish_via_http_includes_accept_license_terms(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    skill_dir = tmp_path / "nano-banana-image-t8"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+    (skill_dir / "run.py").write_text("print('ok')\n", encoding="utf-8")
+
+    monkeypatch.setattr(clawhub, "_read_clawhub_global_config", lambda: {"token": "cfg-token"})
+
+    captured: dict[str, object] = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {"ok": True, "versionId": "ver_123"}
+
+        @property
+        def text(self) -> str:
+            return json.dumps(self.json())
+
+    class _Client:
+        def __init__(self, **kwargs):  # noqa: ANN001
+            captured["init"] = kwargs
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001, ANN204
+            return False
+
+        def post(
+            self,
+            url: str,
+            headers: dict[str, str],
+            data: dict[str, str],
+            files: list[tuple[str, object]],
+        ):  # noqa: ANN001
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["data"] = data
+            captured["files"] = files
+            return _Resp()
+
+    monkeypatch.setattr(clawhub.httpx, "Client", _Client)
+
+    out = clawhub._publish_via_http(
+        skill_dir=skill_dir,
+        skill_slug="nano-banana-image-t8",
+        skill_version="1.0.1",
+        registry_url="https://clawhub.ai",
+        api_token=None,
+    )
+
+    assert "1.0.1" in out
+    assert captured["url"] == "https://clawhub.ai/api/v1/skills"
+    payload = json.loads(str(captured["data"]["payload"]))
+    assert payload["acceptLicenseTerms"] is True

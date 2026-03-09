@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import mimetypes
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -25,6 +27,12 @@ _DETAIL_CACHE_TTL_SECONDS = 900.0
 _DETAIL_ENRICH_MAX_ITEMS = 24
 _CLI_INSPECT_FALLBACK_MAX_ITEMS = 2
 _DETAIL_ENRICH_MAX_WORKERS = 4
+_TEXT_FILE_EXTENSIONS = {
+    "md", "mdx", "txt", "json", "json5", "yaml", "yml", "toml",
+    "js", "cjs", "mjs", "ts", "tsx", "jsx", "py", "sh", "rb", "go",
+    "rs", "swift", "kt", "java", "cs", "cpp", "c", "h", "hpp", "sql",
+    "csv", "ini", "cfg", "env", "xml", "html", "css", "scss", "sass", "svg",
+}
 _search_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
 _detail_cache: dict[str, tuple[float, dict[str, object]]] = {}
 
@@ -889,50 +897,21 @@ def publish_installed_skill(
     workspace_dir: Path,
     api_token: str | None = None,
 ) -> str:
-    """Publish one local installed skill to ClawHub via CLI publish."""
-    if not is_clawhub_cli_available():
-        raise ClawHubCliError("未检测到 clawhub CLI，无法发布技能")
+    """Publish one local installed skill to ClawHub via HTTP publish."""
     target = skill_dir.resolve()
     if not target.is_dir() or not (target / "SKILL.md").is_file():
         raise ClawHubCliError(f"无效技能目录: {target}")
     raw_slug = skill_slug.strip()
     _validate_slug(raw_slug)
     version = _normalize_publish_version(skill_version) or _resolve_publish_version(target)
-
-    env = _build_env(
+    _ = workspace_dir
+    return _publish_via_http(
+        skill_dir=target,
+        skill_slug=raw_slug,
+        skill_version=version,
         registry_url=registry_url,
-        workspace_dir=workspace_dir,
         api_token=api_token,
     )
-
-    try:
-        return _run(
-            [
-                "clawhub",
-                "publish",
-                str(target),
-                "--slug",
-                raw_slug,
-                "--version",
-                version,
-                "--tags",
-                "latest",
-            ],
-            env=env,
-        )
-    except ClawHubCliError as exc:
-        msg = _clean_cli_error(str(exc))
-        if "Only the owner can publish updates" in msg:
-            raise ClawHubCliError(
-                "发布被拒绝：该技能 slug 已存在且你不是所有者，无法覆盖更新。"
-                "请改用新的技能 ID（slug）发布，或切换到该技能所有者账号。"
-            ) from exc
-        if "--version must be valid semver" in msg:
-            raise ClawHubCliError(
-                "发布失败：版本号不合法。请在 SKILL.md 的 frontmatter 中使用 "
-                "version: x.y.z（例如 0.1.0）。"
-            ) from exc
-        raise ClawHubCliError(msg) from exc
 
 
 def _resolve_publish_version(skill_dir: Path) -> str:
@@ -977,6 +956,121 @@ def _validate_slug(slug: str) -> None:
         raise ClawHubCliError("slug 不能为空")
     if "/" in raw or "\\" in raw or ".." in raw:
         raise ClawHubCliError(f"非法 slug: {raw}")
+
+
+def _title_case_slug(name: str) -> str:
+    return " ".join(part.capitalize() for part in re.split(r"[-_]+", name) if part.strip())
+
+
+def _resolve_clawhub_global_config_path() -> Path:
+    override = os.environ.get("CLAWHUB_CONFIG_PATH", "").strip() or os.environ.get(
+        "CLAWDHUB_CONFIG_PATH", ""
+    ).strip()
+    if override:
+        return Path(override).expanduser()
+    home = Path.home()
+    system = platform.system()
+    if system == "Darwin":
+        base = home / "Library" / "Application Support"
+    elif system == "Windows":
+        app_data = os.environ.get("APPDATA", "").strip()
+        base = Path(app_data).expanduser() if app_data else home / "AppData" / "Roaming"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+        base = Path(xdg).expanduser() if xdg else home / ".config"
+    clawhub_path = base / "clawhub" / "config.json"
+    legacy_path = base / "clawdhub" / "config.json"
+    if clawhub_path.is_file():
+        return clawhub_path
+    if legacy_path.is_file():
+        return legacy_path
+    return clawhub_path
+
+
+def _read_clawhub_global_config() -> dict[str, object]:
+    path = _resolve_clawhub_global_config_path()
+    if not path.is_file():
+        return {}
+    with contextlib.suppress(Exception):
+        raw = path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {str(k): v for k, v in parsed.items() if isinstance(k, str)}
+    return {}
+
+
+def _iter_publish_files(skill_dir: Path) -> list[tuple[str, bytes, str]]:
+    files: list[tuple[str, bytes, str]] = []
+    for path in sorted(skill_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel_path = path.relative_to(skill_dir).as_posix()
+        if (
+            rel_path.startswith(".git/")
+            or rel_path.startswith("node_modules/")
+            or rel_path.startswith(".clawhub/")
+            or rel_path.startswith(".clawdhub/")
+        ):
+            continue
+        suffix = path.suffix.lower().lstrip(".")
+        if suffix not in _TEXT_FILE_EXTENSIONS:
+            continue
+        content_type = mimetypes.guess_type(path.name)[0] or "text/plain"
+        files.append((rel_path, path.read_bytes(), content_type))
+    return files
+
+
+def _publish_via_http(
+    *,
+    skill_dir: Path,
+    skill_slug: str,
+    skill_version: str,
+    registry_url: str,
+    api_token: str | None,
+) -> str:
+    cfg = _read_clawhub_global_config()
+    token = api_token or str(cfg.get("token", "")).strip()
+    if not token:
+        raise ClawHubCliError("发布失败：未找到 ClawHub 登录令牌，请先重新登录 ClawHub。")
+
+    files = _iter_publish_files(skill_dir)
+    if not files:
+        raise ClawHubCliError("发布失败：技能目录中没有可上传的文本文件。")
+    if not any(rel.lower() in {"skill.md", "skills.md"} for rel, _, _ in files):
+        raise ClawHubCliError("发布失败：技能目录缺少 SKILL.md。")
+
+    payload = {
+        "slug": skill_slug,
+        "displayName": _title_case_slug(skill_dir.name),
+        "version": skill_version,
+        "changelog": "",
+        "tags": ["latest"],
+        "acceptLicenseTerms": True,
+    }
+    upload_files: list[tuple[str, tuple[str, bytes, str]]] = []
+    for rel_path, content, content_type in files:
+        upload_files.append(("files", (rel_path, content, content_type)))
+
+    with httpx.Client(timeout=45.0, follow_redirects=True) as client:
+        response = client.post(
+            f"{registry_url.rstrip('/')}/api/v1/skills",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=upload_files,
+        )
+    if response.status_code >= 400:
+        detail = response.text.strip() or f"HTTP {response.status_code}"
+        raise ClawHubCliError(_clean_cli_error(detail))
+    with contextlib.suppress(Exception):
+        data = response.json()
+        if isinstance(data, dict):
+            version_id = str(data.get("versionId", "")).strip()
+            if version_id:
+                return f"OK. Published {skill_slug}@{skill_version} ({version_id})"
+    return response.text.strip() or f"OK. Published {skill_slug}@{skill_version}"
 
 
 def _search_via_http(
