@@ -82,3 +82,35 @@ def test_prefer_project_python_rewrites_bare_python(
     rewritten = bash_mod._prefer_project_python("python3 /tmp/a.py && python -V")
     expected = f"{fake_python} /tmp/a.py && {fake_python} -V"
     assert rewritten == expected
+
+
+def test_prefer_project_python_rewrites_direct_python_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_python = tmp_path / "python3.12"
+    fake_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(bash_mod, "_PROJECT_PYTHON", fake_python)
+
+    rewritten = bash_mod._prefer_project_python_for_direct_script(
+        "/tmp/test_nano_banana_2.py --mode edit"
+    )
+
+    assert rewritten == f"{fake_python} /tmp/test_nano_banana_2.py --mode edit"
+
+
+def test_prefer_project_python_rewrites_env_prefixed_direct_python_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_python = tmp_path / "python3.12"
+    fake_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(bash_mod, "_PROJECT_PYTHON", fake_python)
+
+    rewritten = bash_mod._prefer_project_python_for_direct_script(
+        "NANO_BANANA_API_KEY='x' /tmp/test_nano_banana_2.py --mode edit"
+    )
+
+    assert rewritten == (
+        f"NANO_BANANA_API_KEY='x' {fake_python} /tmp/test_nano_banana_2.py --mode edit"
+    )

@@ -268,6 +268,64 @@ class _BashAlwaysFailTool(Tool):
         return ToolResult(success=False, output="", error="bash failed")
 
 
+class _BashPyScriptRetryTool(Tool):
+    """Dummy bash tool that fails on direct .py invocation then succeeds once rewritten."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="bash",
+            description="Fails first for direct python script invocation.",
+            parameters=[ToolParameter(name="command", type="string", description="command")],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        command = str(kwargs.get("command", "")).strip()
+        self.commands.append(command)
+        if command.startswith("/tmp/test_nano_banana_2.py "):
+            return ToolResult(
+                success=False,
+                output="[stderr]\nfrom: command not found\nimport: command not found\n[exit_code: 127]",
+                error="from: command not found\nimport: command not found",
+            )
+        if "python3.12 /tmp/test_nano_banana_2.py --mode edit" in command:
+            return ToolResult(success=True, output="ok")
+        return ToolResult(success=False, output="", error=f"unexpected command: {command}")
+
+
+class _NanoBananaFixedRunnerTool(Tool):
+    """Dummy bash tool that simulates fixed-template nano-banana execution."""
+
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+        self.commands: list[str] = []
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="bash",
+            description="Executes fixed nano-banana command.",
+            parameters=[ToolParameter(name="command", type="string", description="command")],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        command = str(kwargs.get("command", "")).strip()
+        self.commands.append(command)
+        return ToolResult(
+            success=True,
+            output=(
+                "当前使用模型: 香蕉2\n"
+                "[图生图] 测试中...\n"
+                f"图生图成功: {self.output_path}\n"
+                "任务完成\n"
+                "\n[exit_code: 0]"
+            ),
+        )
+
+
 class _PptEditNoopTool(Tool):
     """Dummy ppt_edit tool used for tool-selection assertions."""
 
@@ -906,8 +964,133 @@ async def test_run_agent_repairs_bash_cmd_alias() -> None:
         registry=registry,
     )
 
-    assert result == "done"
+    assert result.endswith("done")
     assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_agent_retries_direct_python_script_bash_invocation() -> None:
+    tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[
+            ToolCall(
+                id="tc_bash",
+                name="bash",
+                arguments={"command": "/tmp/test_nano_banana_2.py --mode edit"},
+            )
+        ],
+    )
+    final_response = AgentResponse(content="done", model="test-model")
+
+    call_count = 0
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],  # noqa: ARG001
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return tool_response
+        return final_response
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    bash_tool = _BashPyScriptRetryTool()
+    registry.register(bash_tool)
+
+    result = await run_agent(
+        message="执行 nano banana 图生图",
+        session_id="test-bash-retry-py-script",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result.endswith("done")
+    assert len(bash_tool.commands) == 2
+    assert bash_tool.commands[0] == "/tmp/test_nano_banana_2.py --mode edit"
+    assert "python3.12 /tmp/test_nano_banana_2.py --mode edit" in bash_tool.commands[1]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_uses_fixed_nano_banana_command_when_params_are_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(key="images", type="images", required=False, min_count=1),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    image_path = tmp_path / "input.png"
+    image_path.write_bytes(b"image")
+    output_path = tmp_path / "image_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": f"把这张图改成天使翅膀\n\n(用户发送了图片)\n![飞书图片1]({image_path})",
+                    "images": 1,
+                    "__model_display__": "香蕉2",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message=f"把这张图改成天使翅膀\n\n(用户发送了图片)\n![飞书图片1]({image_path})",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    assert "当前使用模型：香蕉2" in result
+    assert str(output_path) in result
+    assert len(bash_tool.commands) == 1
+    assert "--mode edit" in bash_tool.commands[0]
+    assert f"--input-image {image_path}" in bash_tool.commands[0]
+    router.chat.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1484,7 +1667,7 @@ async def test_run_agent_skill_lock_requires_explicit_done_confirmation() -> Non
 
     router2 = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
     second = await run_agent(
-        message="完成任务",
+        message="任务结束",
         session_id=session.id,
         config=WhaleclawConfig(),
         router=router2,
@@ -1495,6 +1678,77 @@ async def test_run_agent_skill_lock_requires_explicit_done_confirmation() -> Non
     assert "locked_skill_ids" not in session.metadata
     assert "skill_lock_waiting_done" not in session.metadata
     router2.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_reports_unlock_not_completed_for_task_done_intent_near_miss() -> None:
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-near-miss",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_lock_waiting_done": True,
+        },
+    )
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    result = await run_agent(
+        message="本轮结束啦",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "还没有完成正式解锁" in result
+    assert "请直接回复“任务完成”或“任务结束”" in result
+    router.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_unlocks_locked_skill_even_when_waiting_done_flag_is_false() -> None:
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-unlock-without-waiting-flag",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_lock_waiting_done": False,
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "旧任务",
+                    "images": 2,
+                }
+            },
+        },
+    )
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    result = await run_agent(
+        message="任务完成",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert result == "已确认任务完成，已解除本轮技能锁定。"
+    assert "locked_skill_ids" not in session.metadata
+    assert "skill_lock_waiting_done" not in session.metadata
+    assert "skill_param_state" not in session.metadata
+    router.chat.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2098,7 +2352,7 @@ async def test_nano_banana_guard_lists_missing_params_before_execution() -> None
     )
 
     assert "API Key" in result
-    assert "当前模型：香蕉2（0.06元）可切换模型香蕉pro（0.2元）" in result
+    assert "当前模型：香蕉2（0.1元）可切换模型香蕉pro（0.2元）" in result
     assert "提示词" in result
     assert "图生图图片：已收到 0 张（至少 1 张）" in result
     assert "切换本次模型：切换香蕉2（pro）。设置默认模型：默认模型香蕉2（pro）" in result
@@ -2253,10 +2507,9 @@ async def test_nano_banana_guard_keeps_fixed_template_for_activation_only_messag
         session=session,
     )
 
-    assert "我先确认参数（缺啥补啥）：" in result
-    assert "1) API Key：已就绪" in result
-    assert "3) 提示词：未提供" in result
-    assert "5) 切换本次模型：切换香蕉2（pro）。设置默认模型：默认模型香蕉2（pro）" in result
+    assert "当前会话仍在香蕉生图技能里。" in result
+    assert "如果要继续生图，请直接发送提示词或图片" in result
+    assert "请回复“任务完成”解除技能锁定" in result
     router.chat.assert_not_called()
     monkeypatch.undo()
 
@@ -2344,6 +2597,89 @@ async def test_nano_banana_control_message_does_not_overwrite_existing_prompt() 
         == "把男孩衣服改成紫色"
     )
     router.chat.assert_called_once()
+    monkeypatch.undo()
+
+
+@pytest.mark.asyncio
+async def test_nano_banana_activation_message_reminds_when_session_is_already_locked() -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图", "香蕉pro"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(
+                    key="api_key",
+                    label="API Key",
+                    type="api_key",
+                    required=True,
+                    prompt="请提供 Nano Banana API Key",
+                ),
+                SkillParamItem(
+                    key="prompt",
+                    label="提示词",
+                    type="text",
+                    required=True,
+                    aliases=["提示词", "prompt"],
+                    prompt="请提供提示词",
+                ),
+                SkillParamItem(
+                    key="images",
+                    label="图生图图片",
+                    type="images",
+                    required=False,
+                    min_count=1,
+                    prompt="图生图时请上传至少 1 张图片",
+                ),
+            ],
+        ),
+        source_path=Path("/tmp/nano_guard_activation_complete.md"),
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-guard-activation-complete",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "算了，继续讲笑话给我",
+                    "images": 4,
+                    "__model_display__": "香蕉2",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="使用香蕉生图",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "当前会话仍在香蕉生图技能里。" in result
+    assert "当前模型：香蕉2。" in result
+    assert "如果要继续生图，请直接发送提示词或图片" in result
+    assert "请回复“任务完成”解除技能锁定" in result
+    router.chat.assert_not_called()
     monkeypatch.undo()
 
 

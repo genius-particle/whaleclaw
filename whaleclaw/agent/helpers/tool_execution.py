@@ -27,6 +27,18 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+_PROJECT_PYTHON = Path(__file__).resolve().parents[3] / "python" / "bin" / "python3.12"
+_DIRECT_PY_SCRIPT_RE = re.compile(
+    r"^"
+    r"(?P<prefix>(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|[^\s]+)\s+)*)"
+    r"(?P<script>(?:~|/|\./|\.\./)[^\s;&|]+\.py)"
+    r"(?P<suffix>(?:\s+.*)?)$"
+)
+_PY_SHELL_MISMATCH_HINTS = (
+    "from: command not found",
+    "import: command not found",
+)
+
 
 def create_default_registry(
     session_manager: SessionManager | None = None,
@@ -218,6 +230,7 @@ async def execute_tool(
         else:
             result = await _execute_registered_tool(registry, tc)
             result = await _maybe_retry_after_mkdir(registry, tc, result)
+            result = await _maybe_retry_python_script_invocation(registry, tc, result)
     elif tc.name.startswith("evomap_") and not evomap_enabled:
         result = ToolResult(
             success=False,
@@ -228,6 +241,7 @@ async def execute_tool(
         result = await _execute_registered_tool(registry, tc)
         if tc.name == "bash":
             result = await _maybe_retry_after_mkdir(registry, tc, result)
+            result = await _maybe_retry_python_script_invocation(registry, tc, result)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     log.info(
@@ -273,6 +287,54 @@ async def _maybe_retry_after_mkdir(
     except Exception:
         pass
     return result
+
+
+def _rewrite_direct_python_script_command(command: str) -> str:
+    if not _PROJECT_PYTHON.is_file():
+        return command
+    match = _DIRECT_PY_SCRIPT_RE.match(command.strip())
+    if match is None:
+        return command
+    prefix = match.group("prefix")
+    script = match.group("script")
+    suffix = match.group("suffix") or ""
+    return f"{prefix}{_PROJECT_PYTHON} {script}{suffix}"
+
+
+def _is_python_shell_mismatch(result: ToolResult) -> bool:
+    if result.success:
+        return False
+    text = f"{result.error or ''}\n{result.output or ''}".lower()
+    return any(hint in text for hint in _PY_SHELL_MISMATCH_HINTS)
+
+
+async def _maybe_retry_python_script_invocation(
+    registry: ToolRegistry,
+    tc: ToolCall,
+    result: ToolResult,
+) -> ToolResult:
+    tool = registry.get(tc.name)
+    if result.success or tool is None or tc.name != "bash":
+        return result
+    if not _is_python_shell_mismatch(result):
+        return result
+    raw_command = str(tc.arguments.get("command", "")).strip()
+    if not raw_command:
+        return result
+    rewritten = _rewrite_direct_python_script_command(raw_command)
+    if rewritten == raw_command:
+        return result
+    log.warning(
+        "agent.bash_python_script_retry",
+        original=raw_command[:200],
+        rewritten=rewritten[:200],
+    )
+    retry_args = dict(tc.arguments)
+    retry_args["command"] = rewritten
+    try:
+        return await tool.execute(**retry_args)
+    except Exception:
+        return result
 
 
 def format_tool_output(result: ToolResult) -> str:

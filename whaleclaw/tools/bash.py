@@ -23,6 +23,12 @@ _MAX_OUTPUT = 50_000
 _PROJECT_PYTHON_BIN = Path(__file__).resolve().parents[2] / "python" / "bin"
 _PROJECT_PYTHON = _PROJECT_PYTHON_BIN / "python3.12"
 _PYTHON_CMD_RE = re.compile(r"(?<![\w./-])(python3|python)(?=\s|$)")
+_DIRECT_PY_SCRIPT_RE = re.compile(
+    r"^"
+    r"(?P<prefix>(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|[^\s]+)\s+)*)"
+    r"(?P<script>(?:~|/|\./|\.\./)[^\s;&|]+\.py)"
+    r"(?P<suffix>(?:\s+.*)?)$"
+)
 
 
 def _strip_control_chars(text: str) -> str:
@@ -38,6 +44,19 @@ def _prefer_project_python(command: str) -> str:
     if not _PROJECT_PYTHON.is_file():
         return command
     return _PYTHON_CMD_RE.sub(str(_PROJECT_PYTHON), command)
+
+
+def _prefer_project_python_for_direct_script(command: str) -> str:
+    """Rewrite a direct ``script.py`` invocation to use the embedded Python."""
+    if not _PROJECT_PYTHON.is_file():
+        return command
+    match = _DIRECT_PY_SCRIPT_RE.match(command.strip())
+    if match is None:
+        return command
+    prefix = match.group("prefix")
+    script = match.group("script")
+    suffix = match.group("suffix") or ""
+    return f"{prefix}{_PROJECT_PYTHON} {script}{suffix}"
 
 
 class BashTool(Tool):
@@ -69,7 +88,9 @@ class BashTool(Tool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         raw_command: str = kwargs.get("command", "")
-        command = _prefer_project_python(_strip_control_chars(raw_command))
+        command = _prefer_project_python_for_direct_script(
+            _prefer_project_python(_strip_control_chars(raw_command))
+        )
         timeout: int = int(kwargs.get("timeout", 30))
         background = bool(kwargs.get("background", False))
 

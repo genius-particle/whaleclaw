@@ -368,6 +368,15 @@ _NANO_BANANA_CONTROL_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
 )
 
+_NANO_BANANA_ACTIVATION_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^(?:请)?(?:我想|我要|我想要)?(?:用|使用)?\s*"
+        r"(?:香蕉生图|香蕉文生图|香蕉图生图|banana生图|banana文生图|banana图生图|"
+        r"nanobanana|nano\s*banana|nano-banana-2)\s*$",
+        re.IGNORECASE,
+    ),
+)
+
 
 def is_nano_banana_control_message(text: str) -> bool:
     """Return whether the message is only a Nano Banana control/activation command."""
@@ -375,6 +384,14 @@ def is_nano_banana_control_message(text: str) -> bool:
     if not stripped:
         return False
     return any(pattern.fullmatch(stripped) for pattern in _NANO_BANANA_CONTROL_MESSAGE_PATTERNS)
+
+
+def is_nano_banana_activation_message(text: str) -> bool:
+    """Return whether the message is a pure Nano Banana activation command."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return any(pattern.fullmatch(stripped) for pattern in _NANO_BANANA_ACTIVATION_MESSAGE_PATTERNS)
 
 
 def load_saved_nano_banana_model_display() -> str:
@@ -394,9 +411,9 @@ def _build_nano_banana_param_guard_reply(state: dict[str, object]) -> str:
         state.get("__model_display__", load_saved_nano_banana_model_display())
     ).strip() or "香蕉2"
     if current_model == "香蕉pro":
-        model_line = "2) 当前模型：香蕉pro（0.2元）可切换模型香蕉2（0.06元）"
+        model_line = "2) 当前模型：香蕉pro（0.2元）可切换模型香蕉2（0.1元）"
     else:
-        model_line = "2) 当前模型：香蕉2（0.06元）可切换模型香蕉pro（0.2元）"
+        model_line = "2) 当前模型：香蕉2（0.1元）可切换模型香蕉pro（0.2元）"
 
     prompt_status = "3) 提示词：已收到" if param_satisfied(
         SkillParamItem(key="prompt", type="text"),
@@ -585,6 +602,7 @@ __all__ = [
     "format_param_status",
     "guarded_skills",
     "has_param_secret_source",
+    "is_nano_banana_activation_message",
     "is_nano_banana_control_message",
     "is_skill_switch_consent",
     "is_task_done_confirmation",

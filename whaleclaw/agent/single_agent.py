@@ -12,6 +12,7 @@ path regardless of whether the provider supports native ``tools`` API:
 import asyncio
 import base64
 import re
+import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -97,6 +98,9 @@ from whaleclaw.agent.helpers.skill_lock import (
     detect_nano_banana_model_display as _detect_nano_banana_model_display,
 )
 from whaleclaw.agent.helpers.skill_lock import guarded_skills as _guarded_skills
+from whaleclaw.agent.helpers.skill_lock import (
+    is_nano_banana_activation_message as _is_nano_banana_activation_message,
+)
 from whaleclaw.agent.helpers.skill_lock import (
     is_nano_banana_control_message as _is_nano_banana_control_message,
 )
@@ -238,10 +242,16 @@ _USE_CLEAR_IDS = {"clear", "none", "off", "default", "reset"}
 _TASK_DONE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*任务完成\s*$"),
     re.compile(r"^\s*完成任务\s*$"),
+    re.compile(r"^\s*任务结束\s*$"),
+    re.compile(r"^\s*结束任务\s*$"),
     re.compile(r"^\s*完成了?\s*$"),
     re.compile(r"^\s*结束了?\s*$"),
     re.compile(r"^\s*可以了?\s*$"),
     re.compile(r"^\s*ok\s*$", re.IGNORECASE),
+)
+_TASK_DONE_INTENT_RE = re.compile(
+    r"(?:任务.{0,4}(?:完成|结束)|(?:完成|结束).{0,4}任务|收尾|结束本轮|这轮结束|本轮结束)",
+    re.IGNORECASE,
 )
 _SKILL_SWITCH_CONSENT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:同意|可以|确认|允许).{0,8}(?:切换|换).{0,8}(?:技能|skill)?", re.IGNORECASE),
@@ -998,6 +1008,121 @@ def _extract_input_image_paths_from_text(
         if len(extracted) >= limit:
             break
     return extracted
+
+
+def _strip_inline_image_markdown(text: str) -> str:
+    """Remove appended local image markdown from a user prompt string."""
+    stripped = _IMG_MD_RE.sub("", text)
+    stripped = _ABS_IMAGE_PATH_RE.sub("", stripped)
+    stripped = stripped.replace("(用户发送了图片)", "")
+    return stripped.strip()
+
+
+def _recover_latest_generated_image_path(session: Session | None) -> str:
+    if session is None:
+        return ""
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    latest_generated = str(metadata.get("last_generated_image_path", "")).strip()
+    path = Path(latest_generated).expanduser()
+    if latest_generated and path.is_file():
+        return str(path)
+    return ""
+
+
+def _recover_last_input_image_paths(session: Session | None) -> list[str]:
+    if session is None:
+        return []
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    raw_paths = metadata.get("last_input_image_paths", [])
+    if not isinstance(raw_paths, list):
+        return []
+    output: list[str] = []
+    for item in raw_paths:
+        path = Path(str(item).strip()).expanduser()
+        if path.is_file():
+            output.append(str(path))
+    return output
+
+
+def _resolve_nano_banana_input_paths(
+    llm_message: str,
+    session: Session | None,
+) -> list[str]:
+    """Resolve the input image paths for a nano-banana execution turn."""
+    explicit_paths = _extract_input_image_paths_from_text(llm_message)
+    if explicit_paths:
+        return explicit_paths
+    if _message_requests_image_regenerate(llm_message):
+        return _recover_last_input_image_paths(session)
+    if _message_requests_image_edit(llm_message):
+        latest_generated = _recover_latest_generated_image_path(session)
+        if latest_generated:
+            return [latest_generated]
+        return _recover_last_input_image_paths(session)
+    return []
+
+
+def _build_nano_banana_command(
+    *,
+    model_display: str,
+    prompt: str,
+    input_paths: list[str],
+    ratio: str,
+) -> str:
+    """Build the fixed nano-banana script command."""
+    script_path = (
+        Path.home()
+        / ".whaleclaw"
+        / "workspace"
+        / "skills"
+        / "nano-banana-image-t8"
+        / "scripts"
+        / "test_nano_banana_2.py"
+    )
+    mode = "edit" if input_paths else "text"
+    parts = [
+        "./python/bin/python3.12",
+        shlex.quote(str(script_path)),
+        "--mode",
+        shlex.quote(mode),
+        "--model",
+        shlex.quote(model_display),
+        "--edit-model",
+        shlex.quote(model_display),
+        "--prompt",
+        shlex.quote(prompt),
+        "--aspect-ratio",
+        shlex.quote(ratio or "auto"),
+    ]
+    for path in input_paths:
+        parts.extend(["--input-image", shlex.quote(path)])
+    return " ".join(parts)
+
+
+def _parse_nano_banana_result_path(output: str) -> str:
+    for pattern in (
+        r"图生图成功:\s*(/[^\s]+)",
+        r"文生图成功:\s*(/[^\s]+)",
+        r"(/[^\s]+\.(?:png|jpg|jpeg|webp|gif))",
+    ):
+        match = re.search(pattern, output)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _format_nano_banana_success_reply(
+    *,
+    model_display: str,
+    image_path: str,
+    regenerate: bool,
+) -> str:
+    lead = "重新生成好了：" if regenerate else "改好了："
+    lines = [f"当前使用模型：{model_display}", lead]
+    if image_path:
+        lines.append(f"![结果图]({image_path})")
+        lines.append(f"文件路径：{image_path}")
+    return "\n".join(lines)
 
 
 def _multi_agent_cfg(config: WhaleclawConfig) -> dict[str, object]:
@@ -1841,6 +1966,27 @@ async def run_agent(
                     "如果要继续原流程，请回复“继续沿用原技能”。"
                 )
 
+        if (
+            lock_is_explicit
+            and "nano-banana-image-t8" in locked_skill_ids
+            and _is_nano_banana_activation_message(message)
+        ):
+            model_display = _load_saved_nano_banana_model_display()
+            if session is not None:
+                state_map_raw = session.metadata.get("skill_param_state", {})
+                if isinstance(state_map_raw, dict):
+                    nano_state = state_map_raw.get("nano-banana-image-t8")
+                    if isinstance(nano_state, dict):
+                        model_display = str(
+                            nano_state.get("__model_display__", model_display)
+                        ).strip() or model_display
+            return (
+                "当前会话仍在香蕉生图技能里。"
+                f"当前模型：{model_display}。\n"
+                "如果要继续生图，请直接发送提示词或图片；"
+                "如果本轮已结束，请回复“任务完成”解除技能锁定。"
+            )
+
         use_cmd = _parse_use_command(message, use_cmd_re=_USE_CMD_RE)
         if use_cmd is not None:
             use_skill_ids, remainder = use_cmd
@@ -1871,7 +2017,7 @@ async def run_agent(
                     session.metadata["skill_lock_announce_pending"] = True
                     metadata_dirty = True
                 llm_message = remainder or f"使用技能 {', '.join(locked_skill_ids)} 处理当前请求。"
-        elif lock_waiting_done and _is_task_done_confirmation(
+        elif lock_is_explicit and locked_skill_ids and _is_task_done_confirmation(
             message,
             task_done_patterns=_TASK_DONE_PATTERNS,
         ):
@@ -1891,6 +2037,15 @@ async def run_agent(
                         metadata=session.metadata,
                     )
             return "已确认任务完成，已解除本轮技能锁定。"
+        elif (
+            lock_waiting_done
+            and message.strip()
+            and _TASK_DONE_INTENT_RE.search(message.strip())
+        ):
+            return (
+                "我理解你是在结束当前任务，但这次还没有完成正式解锁。"
+                "请直接回复“任务完成”或“任务结束”，我会立即解除技能锁定。"
+            )
         elif lock_waiting_done:
             lock_waiting_done = False
             if session is not None:
@@ -2061,6 +2216,92 @@ async def run_agent(
                         if s.param_guard is not None
                     ]
                     return "\n\n".join(blocks)
+                if (
+                    "nano-banana-image-t8" in locked_skill_ids
+                    and registry.get("bash") is not None
+                ):
+                    nano_state = state_map.get("nano-banana-image-t8", {})
+                    prompt = _strip_inline_image_markdown(
+                        str(nano_state.get("prompt", "")).strip()
+                    )
+                    model_display = str(
+                        nano_state.get("__model_display__", _load_saved_nano_banana_model_display())
+                    ).strip() or _load_saved_nano_banana_model_display()
+                    ratio = str(nano_state.get("ratio") or "auto").strip() or "auto"
+                    input_paths = _resolve_nano_banana_input_paths(llm_message, session)
+                    if input_paths:
+                        session.metadata["last_input_image_paths"] = input_paths
+                    command = _build_nano_banana_command(
+                        model_display=model_display,
+                        prompt=prompt,
+                        input_paths=input_paths,
+                        ratio=ratio,
+                    )
+                    tc = ToolCall(
+                        id="nano_banana_fixed_runner",
+                        name="bash",
+                        arguments={"command": command, "timeout": 180},
+                    )
+                    if session_manager is not None:
+                        await _persist_message(
+                            session_manager,
+                            session,
+                            "assistant",
+                            "(调用工具: bash)",
+                        )
+                    tc_id, result = await _execute_tool(
+                        registry,
+                        tc,
+                        evomap_enabled=False,
+                        browser_allowed=True,
+                        office_block_bash_probe=False,
+                        office_block_message="",
+                        office_edit_only=False,
+                        office_edit_path="",
+                        on_tool_call=on_tool_call,
+                        on_tool_result=on_tool_result,
+                    )
+                    tool_output = _format_tool_output(result)
+                    if session_manager is not None and not _is_transient_cli_usage_error(result):
+                        snippet = tool_output[:500] if len(tool_output) > 500 else tool_output
+                        await _persist_message(
+                            session_manager,
+                            session,
+                            "tool",
+                            f"[bash] {snippet}",
+                            tool_call_id=tc_id,
+                            tool_name="bash",
+                        )
+                    if result.success:
+                        image_path = _parse_nano_banana_result_path(result.output or "")
+                        if image_path and Path(image_path).expanduser().is_file():
+                            session.metadata["last_generated_image_path"] = image_path
+                        session.metadata["locked_skill_ids"] = locked_skill_ids
+                        session.metadata["skill_lock_waiting_done"] = True
+                        if session_manager is not None:
+                            await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                                session.id,
+                                metadata=session.metadata,
+                            )
+                        final_text = _format_nano_banana_success_reply(
+                            model_display=model_display,
+                            image_path=image_path,
+                            regenerate=_message_requests_image_regenerate(llm_message),
+                        )
+                        final_text = (
+                            f"{final_text}\n\n如果本轮任务已完成，请回复“任务完成”以解除技能锁定；"
+                            "若需继续修改，请直接继续说需求。"
+                        )
+                        if session_manager is not None:
+                            await _persist_message(session_manager, session, "assistant", final_text)
+                        return final_text
+                    fail_text = (
+                        "nano-banana 执行失败。\n"
+                        f"{tool_output}"
+                    )
+                    if session_manager is not None:
+                        await _persist_message(session_manager, session, "assistant", fail_text)
+                    return fail_text
 
     if session is not None:
         pending_raw = session.metadata.get("evomap_pending_choices")
