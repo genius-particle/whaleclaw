@@ -2950,6 +2950,1001 @@ async def test_run_agent_regenerate_reuses_last_input_image_set_for_locked_image
 
 
 @pytest.mark.asyncio
+async def test_run_agent_regenerate_keeps_text_mode_for_fixed_nano_banana_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(key="images", type="images", required=False, min_count=1),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_regenerate_text.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    stale_input_path = tmp_path / "stale-input.png"
+    stale_input_path.write_bytes(b"stale-input")
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+    output_path = tmp_path / "text_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-regenerate-text",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_input_image_paths": [str(stale_input_path)],
+            "last_nano_banana_mode": "text",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "一只熊猫在上海街头跳舞",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "text",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="重新生成，背景改成夜景霓虹",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    assert "当前使用模型：香蕉2" in result
+    assert str(output_path) in result
+    assert len(bash_tool.commands) == 1
+    assert "--mode text" in bash_tool.commands[0]
+    assert "--input-image" not in bash_tool.commands[0]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_regenerate_merges_new_prompt_delta_for_text_nano_banana(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_prompt_merge.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    output_path = tmp_path / "text_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-prompt-merge",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_nano_banana_mode": "text",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "海贼王风格，路飞和娜美在篮球场打篮球",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "text",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message="重新生成，我要真人风格",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert "海贼王风格，路飞和娜美在篮球场打篮球" in command
+    assert "我要真人风格" in command
+    assert "--aspect-ratio auto" in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_new_prompt_replaces_previous_text_prompt_for_nano_banana(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_prompt_replace.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    output_path = tmp_path / "text_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-prompt-replace",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_nano_banana_mode": "text",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "海贼王风格，路飞和娜美在篮球场打篮球",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "text",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message="给我一张赛博朋克风格的城市夜景",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert "--mode text" in command
+    assert "给我一张赛博朋克风格的城市夜景" in command
+    assert "海贼王风格" not in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_regenerate_merges_prompt_and_updates_ratio_for_text_nano_banana(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(
+                    key="ratio",
+                    type="ratio",
+                    required=False,
+                    aliases=["比例", "尺寸", "size"],
+                ),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_prompt_ratio_merge.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    output_path = tmp_path / "text_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-prompt-ratio-merge",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_nano_banana_mode": "text",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "海贼王风格，路飞和娜美在篮球场打篮球",
+                    "ratio": "16:9",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "text",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message="重新生成，我要真人风格的海贼王，路飞跟娜美在篮球场打篮球，图片比例是9:16",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert "海贼王风格，路飞和娜美在篮球场打篮球" in command
+    assert "我要真人风格的海贼王，路飞跟娜美在篮球场打篮球" in command
+    assert "--aspect-ratio 9:16" in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_regenerate_reuses_original_inputs_and_merges_prompt_for_edit_nano_banana(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(key="images", type="images", required=False, min_count=1),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_regenerate_edit.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    original_path = tmp_path / "original.png"
+    original_path.write_bytes(b"original-image")
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+    output_path = tmp_path / "image_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-regenerate-edit",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_input_image_paths": [str(original_path)],
+            "last_nano_banana_mode": "edit",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "将背景改成生化危机9的场景",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "edit",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message="重新生成，再加一些烟雾和火花",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert "--mode edit" in command
+    assert f"--input-image {original_path}" in command
+    assert f"--input-image {generated_path}" not in command
+    assert "将背景改成生化危机9的场景" in command
+    assert "再加一些烟雾和火花" in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_edit_followup_add_object_reuses_latest_generated_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(key="images", type="images", required=False, min_count=1),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_add_object.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+    output_path = tmp_path / "image_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-add-object",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_nano_banana_mode": "edit",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "将背景改成生化危机9的场景",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "edit",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message="后面加一只暴君",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert "--mode edit" in command
+    assert f"--input-image {generated_path}" in command
+    assert "将背景改成生化危机9的场景" in command
+    assert "后面加一只暴君" in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_edit_followup_continues_last_edit_mode_without_explicit_edit_keyword(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(key="images", type="images", required=False, min_count=1),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_continue_edit_mode.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+    output_path = tmp_path / "image_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-continue-edit-mode",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_nano_banana_mode": "edit",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "将背景改成生化危机9的场景",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "edit",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message="把压迫感再加强一点",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert "--mode edit" in command
+    assert f"--input-image {generated_path}" in command
+    assert "把压迫感再加强一点" in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_text_to_image_followup_with_subject_reference_switches_to_edit_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_subject_reference_edit.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+    output_path = tmp_path / "image_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-subject-reference-edit",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_nano_banana_mode": "text",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "一只猩猩在丛林里荡秋千",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "text",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message="让这猩猩穿着钢铁盔甲",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert "--mode edit" in command
+    assert f"--input-image {generated_path}" in command
+    assert "一只猩猩在丛林里荡秋千" in command
+    assert "让这猩猩穿着钢铁盔甲" in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_explicit_new_image_request_breaks_previous_edit_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_break_edit_chain.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+    output_path = tmp_path / "text_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-break-edit-chain",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_nano_banana_mode": "edit",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "把这个场景改成在水里面",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "edit",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message="做一张图，海贼王路飞跟娜美正在掰手腕",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert "--mode text" in command
+    assert "--input-image" not in command
+    assert "海贼王路飞跟娜美正在掰手腕" in command
+    assert "把这个场景改成在水里面" not in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_new_uploaded_image_starts_fresh_image_to_image_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(key="images", type="images", required=False, min_count=1),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_fresh_uploaded_image.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    previous_generated = tmp_path / "previous-generated.png"
+    previous_generated.write_bytes(b"previous-generated")
+    new_input = tmp_path / "new-input.png"
+    new_input.write_bytes(b"new-input")
+    output_path = tmp_path / "image_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-fresh-uploaded-image",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(previous_generated),
+            "last_input_image_paths": [str(previous_generated)],
+            "last_nano_banana_mode": "edit",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "把这个场景改成在水里面",
+                    "images": 1,
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "edit",
+                }
+            },
+        },
+    )
+
+    await run_agent(
+        message=(
+            f"做一张图，赛博朋克城市里的机甲猫\n\n"
+            f"(用户发送了图片)\n![飞书图片1]({new_input})"
+        ),
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    command = bash_tool.commands[0]
+    assert f"--input-image {new_input}" in command
+    assert f"--input-image {previous_generated}" not in command
+    assert "赛博朋克城市里的机甲猫" in command
+    assert "把这个场景改成在水里面" not in command
+
+
+@pytest.mark.asyncio
+async def test_run_agent_uses_2k_image_size_for_nano_banana_pro_fixed_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_2k_pro.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    output_path = tmp_path / "text_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-2k-pro",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "生成一张海报",
+                    "__model_display__": "香蕉pro",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="用香蕉pro生成一张海报",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    assert "当前使用模型：香蕉pro" in result
+    assert len(bash_tool.commands) == 1
+    assert "--image-size 2K" in bash_tool.commands[0]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_does_not_use_2k_image_size_for_nano_banana_2_fixed_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+            ],
+        ),
+        source_path=Path("/tmp/nano_fixed_runner_2k_gemini.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    output_path = tmp_path / "text_to_image.png"
+    output_path.write_bytes(b"out")
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-fixed-runner-2k-gemini",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "生成一张海报",
+                    "__model_display__": "香蕉2",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="用香蕉2生成一张海报",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    assert "当前使用模型：香蕉2" in result
+    assert len(bash_tool.commands) == 1
+    assert "--image-size 2K" not in bash_tool.commands[0]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_regenerate_does_not_reuse_images_for_text_mode_nano_banana(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["nanobanana"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+            ],
+        ),
+        source_path=Path("/tmp/nano_guard_regenerate_text.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    stale_input_path = tmp_path / "stale-input.png"
+    stale_input_path.write_bytes(b"stale-input")
+    generated_path = tmp_path / "generated.png"
+    generated_path.write_bytes(b"generated-image")
+
+    seen_user_images: list[Any] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        for item in messages:
+            if getattr(item, "role", "") == "user":
+                seen_user_images.append(getattr(item, "images", None))
+        return AgentResponse(content="继续文生图", model="test-model")
+
+    router = _make_router(chat_fn=fake_chat)
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-guard-regenerate-text",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_generated_image_path": str(generated_path),
+            "last_input_image_paths": [str(stale_input_path)],
+            "last_nano_banana_mode": "text",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "sk-test",
+                    "prompt": "一只熊猫在上海街头跳舞",
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "text",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="重新生成，改成水彩风",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=ToolRegistry(),
+        session=session,
+    )
+
+    assert "继续文生图" in result
+    assert all(not images for images in seen_user_images)
+
+
+@pytest.mark.asyncio
 async def test_run_agent_does_not_reuse_images_for_plain_chat_under_locked_image_skill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -34,7 +34,7 @@ from whaleclaw.plugins.loader import PluginLoader
 from whaleclaw.plugins.registry import PluginRegistry
 from whaleclaw.providers.router import ModelRouter
 from whaleclaw.sessions.group_compressor import SessionGroupCompressor
-from whaleclaw.sessions.manager import SessionManager
+from whaleclaw.sessions.manager import Session, SessionManager
 from whaleclaw.sessions.store import SessionStore
 from whaleclaw.skills.clawhub import (
     ClawHubCliError,
@@ -372,6 +372,43 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         manager = SessionManager(store, config)
         state["manager"] = manager
+        compression_router = ModelRouter(config.models)
+
+        async def _on_message_persisted(session: Session, role: str, _content: str) -> None:
+            if role != "assistant" or not isinstance(session, Session):
+                return
+            group_compressor = state["group_compressor"]
+            if (
+                not isinstance(group_compressor, SessionGroupCompressor)
+                or not config.agent.summarizer.enabled
+                or not session.messages
+            ):
+                return
+            model_id = config.agent.summarizer.model.strip()
+            if not model_id:
+                return
+
+            async def _run_followup() -> None:
+                try:
+                    await group_compressor.build_window_messages(
+                        session_id=session.id,
+                        messages=list(session.messages),
+                        router=compression_router,
+                        model_id=model_id,
+                    )
+                except Exception as exc:
+                    log.debug(
+                        "gateway.group_compress_followup_failed",
+                        session_id=session.id,
+                        error=str(exc),
+                    )
+
+            asyncio.create_task(
+                _run_followup(),
+                name=f"group-compress-followup-{session.id[:8]}",
+            )
+
+        manager.set_message_persist_hook(_on_message_persisted)
         memory_store = SimpleMemoryStore(persist_dir=MEMORY_DIR)
         memory_manager = MemoryManager(memory_store)
         state["memory_manager"] = memory_manager

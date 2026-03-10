@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -14,6 +15,8 @@ from whaleclaw.sessions.store import SessionStore
 from whaleclaw.utils.log import get_logger
 
 log = get_logger(__name__)
+
+MessagePersistHook = Callable[["Session", str, str], Awaitable[None] | None]
 
 
 class Session(BaseModel):
@@ -37,10 +40,14 @@ class SessionManager:
     def __init__(self, store: SessionStore, config: WhaleclawConfig) -> None:
         self._store = store
         self._config = config
+        self._message_persist_hook: MessagePersistHook | None = None
 
     @property
     def store(self) -> SessionStore:
         return self._store
+
+    def set_message_persist_hook(self, hook: MessagePersistHook | None) -> None:
+        self._message_persist_hook = hook
 
     async def create(self, channel: str, peer_id: str) -> Session:
         """Create a new session."""
@@ -129,6 +136,10 @@ class SessionManager:
         await self._store.update_session_field(
             session.id, updated_at=session.updated_at.isoformat()
         )
+        if role == "assistant" and self._message_persist_hook is not None:
+            maybe_awaitable = self._message_persist_hook(session, role, content)
+            if maybe_awaitable is not None:
+                await maybe_awaitable
 
     async def update_model(self, session: Session, model: str) -> None:
         """Switch the model for a session."""
@@ -141,8 +152,8 @@ class SessionManager:
 
     async def update_metadata(self, session: Session, metadata: dict[str, Any]) -> None:
         """Update session metadata and persist it."""
-        session.metadata = metadata
-        await self._store.update_session_field(session.id, metadata=metadata)
+        merged = await self._store.update_session_metadata(session.id, metadata)
+        session.metadata = merged
 
     async def reset(self, session_id: str) -> Session | None:
         """Clear messages but keep the session."""

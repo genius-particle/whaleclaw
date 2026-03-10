@@ -92,25 +92,255 @@ async def test_build_window_messages_schedules_background_generation(tmp_path) -
         assert elapsed < 0.2
         assert output
 
-        plan = compressor._window_plan(_flatten(groups))  # noqa: SLF001
-        first = next(item for item in plan if item.level != "L2")
-        source_hash = _hash_group(first.group)
-
+        plan = [item for item in compressor._window_plan(_flatten(groups)) if item.level != "L2"]  # noqa: SLF001
         found = False
         for _ in range(20):
-            cached = await store.get_group_compression(
-                session_id="s2",
-                group_idx=first.group_idx,
-                level=first.level,
-                source_hash=source_hash,
-            )
-            if cached:
-                found = True
+            for item in plan:
+                cached = await store.get_group_compression(
+                    session_id="s2",
+                    group_idx=item.group_idx,
+                    level=item.level,
+                    source_hash=_hash_group(item.group),
+                )
+                if cached:
+                    found = True
+                    break
+            if found:
                 break
             await asyncio.sleep(0.05)
 
         assert found
         assert router.calls > 0
+    finally:
+        await compressor.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_session_resumes_only_pending_jobs(tmp_path) -> None:  # noqa: ANN001
+    store = await _mk_store(tmp_path)
+    compressor = SessionGroupCompressor(store)
+    try:
+        now = datetime.now(UTC).isoformat()
+        await store.save_session(
+            session_id="s-pending",
+            channel="webchat",
+            peer_id="u-pending",
+            model="qwen/qwen3.5-plus",
+            created_at=now,
+            updated_at=now,
+            metadata={},
+        )
+        groups = [_mk_group(i, "需要压缩的历史消息 " + ("x" * 80)) for i in range(1, 25 + 1)]
+        plan = compressor._window_plan(_flatten(groups))  # noqa: SLF001
+        compressed = [item for item in plan if item.level != "L2"]
+        pending_items = compressed[:6]
+        await store.update_session_field(
+            "s-pending",
+            metadata={
+                "group_compression_plan_levels": {
+                    str(item.group_idx): item.level for item in plan
+                },
+                "group_compression_pending": [
+                    {"group_idx": item.group_idx, "level": item.level} for item in pending_items
+                ],
+            },
+        )
+
+        router = _SlowRouter()
+        stats = await compressor.prewarm_session(
+            session_id="s-pending",
+            messages=_flatten(groups),
+            router=router,  # type: ignore[arg-type]
+            model_id="compress-model",
+        )
+
+        session = await store.get_session("s-pending")
+        pending_after = session.metadata.get("group_compression_pending", []) if session else []
+        assert stats["total_groups"] == 6
+        assert stats["processed_groups"] == 6
+        assert router.calls == 6
+        assert pending_after == []
+    finally:
+        await compressor.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_window_messages_enqueues_only_shifted_groups(tmp_path) -> None:  # noqa: ANN001
+    store = await _mk_store(tmp_path)
+    compressor = SessionGroupCompressor(store)
+    try:
+        now = datetime.now(UTC).isoformat()
+        await store.save_session(
+            session_id="s-shift",
+            channel="webchat",
+            peer_id="u-shift",
+            model="qwen/qwen3.5-plus",
+            created_at=now,
+            updated_at=now,
+            metadata={},
+        )
+        old_groups = [_mk_group(i, "历史消息 " + ("x" * 80)) for i in range(1, 25 + 1)]
+        old_plan = compressor._window_plan(_flatten(old_groups))  # noqa: SLF001
+        await store.update_session_field(
+            "s-shift",
+            metadata={
+                "group_compression_plan_levels": {
+                    str(item.group_idx): item.level for item in old_plan
+                },
+                "group_compression_pending": [],
+            },
+        )
+
+        new_groups = [_mk_group(i, "历史消息 " + ("x" * 80)) for i in range(1, 29 + 1)]
+        router = _SlowRouter()
+        await compressor.build_window_messages(
+            session_id="s-shift",
+            messages=_flatten(new_groups),
+            router=router,  # type: ignore[arg-type]
+            model_id="compress-model",
+        )
+
+        session = await store.get_session("s-shift")
+        assert session is not None
+        pending = session.metadata.get("group_compression_pending", [])
+        assert isinstance(pending, list)
+        pending_pairs = {
+            (int(item["group_idx"]), str(item["level"]))
+            for item in pending
+            if isinstance(item, dict)
+        }
+        assert len(pending_pairs) == 8
+        assert pending_pairs == {
+            (14, "L0"),
+            (15, "L0"),
+            (16, "L0"),
+            (17, "L0"),
+            (21, "L1"),
+            (22, "L1"),
+            (23, "L1"),
+            (24, "L1"),
+        }
+    finally:
+        await compressor.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_session_skips_already_cached_shifted_groups(tmp_path) -> None:  # noqa: ANN001
+    store = await _mk_store(tmp_path)
+    compressor = SessionGroupCompressor(store)
+    try:
+        now = datetime.now(UTC).isoformat()
+        await store.save_session(
+            session_id="s-cached-shift",
+            channel="webchat",
+            peer_id="u-cached-shift",
+            model="qwen/qwen3.5-plus",
+            created_at=now,
+            updated_at=now,
+            metadata={},
+        )
+        old_groups = [_mk_group(i, "历史消息 " + ("x" * 80)) for i in range(1, 25 + 1)]
+        old_plan = compressor._window_plan(_flatten(old_groups))  # noqa: SLF001
+        await store.update_session_field(
+            "s-cached-shift",
+            metadata={
+                "group_compression_plan_levels": {
+                    str(item.group_idx): item.level for item in old_plan
+                },
+                "group_compression_pending": [],
+            },
+        )
+
+        new_groups = [_mk_group(i, "历史消息 " + ("x" * 80)) for i in range(1, 29 + 1)]
+        new_plan = compressor._window_plan(_flatten(new_groups))  # noqa: SLF001
+        shifted_items = [
+            item
+            for item in new_plan
+            if item.level != "L2"
+            and next(
+                (old.level for old in old_plan if old.group_idx == item.group_idx),
+                None,
+            ) != item.level
+        ]
+        assert shifted_items
+        for item in shifted_items:
+            await store.upsert_group_compression(
+                session_id="s-cached-shift",
+                group_idx=item.group_idx,
+                level=item.level,
+                source_hash=_hash_group(item.group),
+                content=f"cached-{item.group_idx}-{item.level}",
+            )
+
+        router = _SlowRouter()
+        stats = await compressor.prewarm_session(
+            session_id="s-cached-shift",
+            messages=_flatten(new_groups),
+            router=router,  # type: ignore[arg-type]
+            model_id="compress-model",
+        )
+
+        session = await store.get_session("s-cached-shift")
+        assert session is not None
+        assert session.metadata.get("group_compression_pending", []) == []
+        assert stats["total_groups"] == 0
+        assert stats["processed_groups"] == 0
+        assert router.calls == 0
+    finally:
+        await compressor.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_window_messages_reschedules_existing_pending_jobs(tmp_path) -> None:  # noqa: ANN001
+    store = await _mk_store(tmp_path)
+    compressor = SessionGroupCompressor(store)
+    try:
+        now = datetime.now(UTC).isoformat()
+        await store.save_session(
+            session_id="s-retry-pending",
+            channel="webchat",
+            peer_id="u-retry-pending",
+            model="qwen/qwen3.5-plus",
+            created_at=now,
+            updated_at=now,
+            metadata={},
+        )
+        groups = [_mk_group(i, "需要压缩的历史消息 " + ("x" * 80)) for i in range(1, 25 + 1)]
+        plan = compressor._window_plan(_flatten(groups))  # noqa: SLF001
+        compressed = [item for item in plan if item.level != "L2"]
+        pending_items = compressed[:2]
+        await store.update_session_field(
+            "s-retry-pending",
+            metadata={
+                "group_compression_plan_levels": {
+                    str(item.group_idx): item.level for item in plan
+                },
+                "group_compression_pending": [
+                    {"group_idx": item.group_idx, "level": item.level} for item in pending_items
+                ],
+            },
+        )
+
+        router = _SlowRouter()
+        await compressor.build_window_messages(
+            session_id="s-retry-pending",
+            messages=_flatten(groups),
+            router=router,  # type: ignore[arg-type]
+            model_id="compress-model",
+        )
+        pending_after: list[dict[str, object]] | object = [{"group_idx": -1, "level": "L0"}]
+        for _ in range(20):
+            session = await store.get_session("s-retry-pending")
+            pending_after = session.metadata.get("group_compression_pending", []) if session else []
+            if pending_after == []:
+                break
+            await asyncio.sleep(0.05)
+        assert router.calls == 2
+        assert pending_after == []
     finally:
         await compressor.shutdown()
         await store.close()

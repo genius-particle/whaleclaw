@@ -200,6 +200,11 @@ class _PendingBuild:
     model_id: str
 
 
+class _CompressionState(TypedDict):
+    plan_levels: dict[str, str]
+    pending: list[dict[str, object]]
+
+
 class SessionGroupCompressor:
     """LLM semantic compression for session groups with persistent cache."""
 
@@ -209,6 +214,7 @@ class SessionGroupCompressor:
         self._inflight_keys: set[str] = set()
         self._drain_tasks: dict[str, asyncio.Task[None]] = {}
         self._suspended_sessions: set[str] = set()
+        self._state_locks: dict[str, asyncio.Lock] = {}
 
     async def set_session_suspended(self, *, session_id: str, suspended: bool) -> None:
         """Suspend or resume compression activity for a specific session."""
@@ -245,9 +251,35 @@ class SessionGroupCompressor:
                 "cache_hits": 0,
                 "generated": 0,
             }
-        plan = [x for x in self._window_plan(messages) if x.level != "L2"]
-        total = len(plan)
-        if total == 0:
+        plan_all = self._window_plan(messages)
+        plan_by_key = {
+            self._pending_key(
+                session_id=session_id,
+                group_idx=item.group_idx,
+                level=item.level,
+            ): item
+            for item in plan_all
+            if item.level != "L2"
+        }
+        _, pending_keys = await self._sync_plan_state(
+            session_id=session_id,
+            plan=plan_all,
+            router=router,
+            model_id=model_id,
+            schedule_background=False,
+        )
+        if not pending_keys:
+            return {
+                "total_groups": 0,
+                "processed_groups": 0,
+                "cache_hits": 0,
+                "generated": 0,
+            }
+        cache_hits = 0
+        generated = 0
+        relevant_keys = [key for key in pending_keys if key in plan_by_key]
+        if not relevant_keys:
+            await self._prune_pending_state(session_id=session_id, keep_keys=set())
             return {
                 "total_groups": 0,
                 "processed_groups": 0,
@@ -255,63 +287,37 @@ class SessionGroupCompressor:
                 "generated": 0,
             }
 
-        cache_hits = 0
-        pending: list[_WindowItem] = []
-        for item in plan:
-            source_hash = _hash_group(item.group)
-            cached = await self._store.get_group_compression(
-                session_id=session_id,
-                group_idx=item.group_idx,
-                level=item.level,
-                source_hash=source_hash,
-            )
-            if cached:
-                cache_hits += 1
-            else:
-                pending.append(item)
-
-        need_generate = len(pending)
-        if need_generate == 0:
-            log.info(
-                "compressor.prewarm_skip",
-                session_id=session_id,
-                cache_hits=cache_hits,
-                total=total,
-            )
-            return {
-                "total_groups": 0,
-                "processed_groups": 0,
-                "cache_hits": cache_hits,
-                "generated": 0,
-            }
-
         log.info(
             "compressor.prewarm_start",
             session_id=session_id,
-            total=need_generate,
-            cache_hits=cache_hits,
+            total=len(relevant_keys),
+            cache_hits=0,
         )
-        generated = 0
-        for idx, item in enumerate(pending, start=1):
-            await self._get_or_build_group(
+        for idx, key in enumerate(relevant_keys, start=1):
+            item = plan_by_key[key]
+            _, cache_hit = await self._get_or_build_group(
                 session_id=session_id,
                 item=item,
                 router=router,
                 model_id=model_id,
             )
-            generated += 1
+            if cache_hit:
+                cache_hits += 1
+            else:
+                generated += 1
+            await self._mark_pending_done(session_id=session_id, key=key)
             log.info(
                 "compressor.prewarm_progress",
                 session_id=session_id,
-                progress=f"{idx}/{need_generate}",
+                progress=f"{idx}/{len(relevant_keys)}",
                 done=idx,
-                total=need_generate,
+                total=len(relevant_keys),
                 level=item.level,
                 group_idx=item.group_idx,
             )
         return {
-            "total_groups": need_generate,
-            "processed_groups": generated,
+            "total_groups": len(relevant_keys),
+            "processed_groups": len(relevant_keys),
             "cache_hits": cache_hits,
             "generated": generated,
         }
@@ -335,6 +341,13 @@ class SessionGroupCompressor:
             return groups[-1]
 
         plan = self._window_plan(messages)
+        _, pending_keys = await self._sync_plan_state(
+            session_id=session_id,
+            plan=plan,
+            router=router,
+            model_id=model_id,
+            schedule_background=True,
+        )
         rendered: list[list[Message]] = []
         compressed_items = [(idx, item) for idx, item in enumerate(plan) if item.level != "L2"]
         compressed_results: dict[int, tuple[str, bool]] = {}
@@ -343,7 +356,7 @@ class SessionGroupCompressor:
         )
         cache_hits = 0
         generated = 0
-        scheduled = 0
+        scheduled = len(pending_keys)
         fallback_used = 0
         generated_input_tokens = 0
         generated_output_tokens = 0
@@ -364,7 +377,7 @@ class SessionGroupCompressor:
             resolved = await asyncio.gather(
                 *(_resolve_cached(i, item) for i, item in compressed_items)
             )
-            for i, item, source_hash, cached in resolved:
+            for i, item, _source_hash, cached in resolved:
                 if cached is not None:
                     compressed_results[i] = (cached, True)
                     cache_hits += 1
@@ -375,14 +388,6 @@ class SessionGroupCompressor:
                 compressed_results[i] = (fallback, False)
                 fallback_used += 1
                 compressed_output_tokens += _estimate_tokens(fallback)
-                if self._schedule_background_group_build(
-                    session_id=session_id,
-                    item=item,
-                    source_hash=source_hash,
-                    router=router,
-                    model_id=model_id,
-                ):
-                    scheduled += 1
 
         history_items: list[tuple[int, str]] = []
         recent_l2_items: list[tuple[int, list[Message]]] = []
@@ -598,7 +603,11 @@ class SessionGroupCompressor:
         model = model_id.strip()
         if not model:
             return False
-        key = f"{session_id}:{item.group_idx}:{item.level}:{source_hash}"
+        key = self._pending_key(
+            session_id=session_id,
+            group_idx=item.group_idx,
+            level=item.level,
+        )
         if key in self._inflight_keys:
             return False
         queue = self._pending_by_session.setdefault(session_id, {})
@@ -681,12 +690,16 @@ class SessionGroupCompressor:
     ) -> bool:
         t0 = time.monotonic()
         try:
+            if not await self._should_run_pending_job(session_id=session_id, pending=pending):
+                await self._mark_pending_done(session_id=session_id, key=key)
+                return True
             _, cache_hit = await self._get_or_build_group(
                 session_id=session_id,
                 item=pending.item,
                 router=pending.router,
                 model_id=pending.model_id,
             )
+            await self._mark_pending_done(session_id=session_id, key=key)
             log.debug(
                 "group_compressor.bg_group_done",
                 session_id=session_id,
@@ -751,6 +764,259 @@ class SessionGroupCompressor:
         except Exception:
             pass
         return source[: budget * 3]
+
+    async def _load_state(self, *, session_id: str) -> _CompressionState:
+        row = await self._store.get_session(session_id)
+        metadata = row.metadata if row is not None and isinstance(row.metadata, dict) else {}
+        raw_plan = metadata.get("group_compression_plan_levels", {})
+        plan_levels: dict[str, str] = {}
+        if isinstance(raw_plan, dict):
+            for key, value in raw_plan.items():
+                if not isinstance(key, str):
+                    continue
+                level = str(value).strip()
+                if level in {"L0", "L1", "L2"}:
+                    plan_levels[key] = level
+        raw_pending = metadata.get("group_compression_pending", [])
+        pending: list[dict[str, object]] = []
+        if isinstance(raw_pending, list):
+            for item in raw_pending:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    group_idx = int(item.get("group_idx", 0))
+                except (TypeError, ValueError):
+                    continue
+                level = str(item.get("level", "")).strip()
+                if group_idx <= 0 or level not in {"L0", "L1"}:
+                    continue
+                pending.append({"group_idx": group_idx, "level": level})
+        return {"plan_levels": plan_levels, "pending": pending}
+
+    async def _save_state(
+        self,
+        *,
+        session_id: str,
+        plan_levels: dict[str, str],
+        pending: list[dict[str, object]],
+    ) -> None:
+        row = await self._store.get_session(session_id)
+        if row is None:
+            return
+        metadata = row.metadata.copy()
+        metadata["group_compression_plan_levels"] = plan_levels
+        metadata["group_compression_pending"] = pending
+        await self._store.update_session_field(session_id, metadata=metadata)
+
+    async def _sync_plan_state(
+        self,
+        *,
+        session_id: str,
+        plan: list[_WindowItem],
+        router: ModelRouter,
+        model_id: str,
+        schedule_background: bool,
+    ) -> tuple[dict[str, str], set[str]]:
+        added_entries: list[dict[str, object]] = []
+        cached_keys: set[str] = set()
+        async with self._state_lock(session_id=session_id):
+            state = await self._load_state(session_id=session_id)
+            previous_levels = state["plan_levels"]
+            pending_entries = state["pending"]
+            current_levels = {str(item.group_idx): item.level for item in plan}
+            plan_by_key = {
+                self._pending_key(
+                    session_id=session_id,
+                    group_idx=item.group_idx,
+                    level=item.level,
+                ): item
+                for item in plan
+                if item.level != "L2"
+            }
+            pending_keys = {
+                self._pending_key(
+                    session_id=session_id,
+                    group_idx=int(entry["group_idx"]),
+                    level=str(entry["level"]),
+                )
+                for entry in pending_entries
+            }
+            current_pending = list(pending_entries)
+            compressed_items = [item for item in plan if item.level != "L2"]
+            new_entries: list[dict[str, object]] = []
+            if not previous_levels:
+                for item in compressed_items:
+                    key = self._pending_key(
+                        session_id=session_id,
+                        group_idx=item.group_idx,
+                        level=item.level,
+                    )
+                    if key in pending_keys:
+                        continue
+                    cached = await self._store.get_group_compression(
+                        session_id=session_id,
+                        group_idx=item.group_idx,
+                        level=item.level,
+                        source_hash=_hash_group(item.group),
+                    )
+                    if cached is not None:
+                        cached_keys.add(key)
+                        continue
+                    pending_keys.add(key)
+                    entry = {"group_idx": item.group_idx, "level": item.level}
+                    new_entries.append(entry)
+                    added_entries.append(entry)
+            else:
+                for item in compressed_items:
+                    previous_level = previous_levels.get(str(item.group_idx))
+                    if previous_level == item.level:
+                        continue
+                    key = self._pending_key(
+                        session_id=session_id,
+                        group_idx=item.group_idx,
+                        level=item.level,
+                    )
+                    if key in pending_keys:
+                        continue
+                    cached = await self._store.get_group_compression(
+                        session_id=session_id,
+                        group_idx=item.group_idx,
+                        level=item.level,
+                        source_hash=_hash_group(item.group),
+                    )
+                    if cached is not None:
+                        cached_keys.add(key)
+                        continue
+                    pending_keys.add(key)
+                    entry = {"group_idx": item.group_idx, "level": item.level}
+                    new_entries.append(entry)
+                    added_entries.append(entry)
+
+            valid_levels = {
+                self._pending_key(session_id=session_id, group_idx=item.group_idx, level=item.level)
+                for item in compressed_items
+            }
+            merged_pending = [
+                entry
+                for entry in [*current_pending, *new_entries]
+                if self._pending_key(
+                    session_id=session_id,
+                    group_idx=int(entry["group_idx"]),
+                    level=str(entry["level"]),
+                ) in valid_levels
+            ]
+            await self._save_state(
+                session_id=session_id,
+                plan_levels=current_levels,
+                pending=merged_pending,
+            )
+            merged_keys = {
+                self._pending_key(
+                    session_id=session_id,
+                    group_idx=int(entry["group_idx"]),
+                    level=str(entry["level"]),
+                )
+                for entry in merged_pending
+            }
+            schedule_items = [
+                plan_by_key[key]
+                for key in merged_keys
+                if key in plan_by_key
+            ]
+        if added_entries:
+            log.info(
+                "group_compressor.pending_enqueued",
+                session_id=session_id,
+                added=len(added_entries),
+                total_pending=len(merged_keys),
+                added_items=added_entries[:12],
+                summary_zh=(
+                    f"检测到窗口层级迁移，新增待压缩{len(added_entries)}组，"
+                    f"当前待压缩总数{len(merged_keys)}组。"
+                ),
+            )
+        elif cached_keys:
+            log.info(
+                "group_compressor.pending_cache_reused",
+                session_id=session_id,
+                reused=len(cached_keys),
+                summary_zh=f"检测到{len(cached_keys)}组已存在压缩缓存，启动时直接复用，无需重新排队。",
+            )
+        if schedule_background:
+            for item in schedule_items:
+                self._schedule_background_group_build(
+                    session_id=session_id,
+                    item=item,
+                    source_hash=_hash_group(item.group),
+                    router=router,
+                    model_id=model_id,
+                )
+        return current_levels, merged_keys
+
+    async def _mark_pending_done(self, *, session_id: str, key: str) -> None:
+        async with self._state_lock(session_id=session_id):
+            state = await self._load_state(session_id=session_id)
+            pending = [
+                entry
+                for entry in state["pending"]
+                if self._pending_key(
+                    session_id=session_id,
+                    group_idx=int(entry["group_idx"]),
+                    level=str(entry["level"]),
+                ) != key
+            ]
+            await self._save_state(
+                session_id=session_id,
+                plan_levels=state["plan_levels"],
+                pending=pending,
+            )
+            remaining = len(pending)
+        log.info(
+            "group_compressor.pending_cleared",
+            session_id=session_id,
+            cleared_key=key,
+            remaining_pending=remaining,
+            summary_zh=f"已完成1组压缩任务，剩余待压缩{remaining}组。",
+        )
+
+    async def _prune_pending_state(self, *, session_id: str, keep_keys: set[str]) -> None:
+        async with self._state_lock(session_id=session_id):
+            state = await self._load_state(session_id=session_id)
+            pending = [
+                entry
+                for entry in state["pending"]
+                if self._pending_key(
+                    session_id=session_id,
+                    group_idx=int(entry["group_idx"]),
+                    level=str(entry["level"]),
+                ) in keep_keys
+            ]
+            await self._save_state(
+                session_id=session_id,
+                plan_levels=state["plan_levels"],
+                pending=pending,
+            )
+
+    async def _should_run_pending_job(
+        self,
+        *,
+        session_id: str,
+        pending: _PendingBuild,
+    ) -> bool:
+        state = await self._load_state(session_id=session_id)
+        desired = state["plan_levels"].get(str(pending.item.group_idx))
+        return desired == pending.item.level
+
+    @staticmethod
+    def _pending_key(*, session_id: str, group_idx: int, level: str) -> str:
+        return f"{session_id}:{group_idx}:{level}"
+
+    def _state_lock(self, *, session_id: str) -> asyncio.Lock:
+        lock = self._state_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._state_locks[session_id] = lock
+        return lock
 
     def _truncate_group_atomic(self, groups: list[list[Message]]) -> list[list[Message]]:
         if not groups:

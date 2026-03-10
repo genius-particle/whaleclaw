@@ -240,10 +240,10 @@ def skill_trigger_mentioned(skill: Skill, text: str) -> bool:
 
 
 def extract_ratio_or_size(text: str) -> str:
-    ratio = re.search(r"\b(\d{1,2}\s*:\s*\d{1,2})\b", text)
+    ratio = re.search(r"(?<!\d)(\d{1,2}\s*:\s*\d{1,2})(?!\d)", text)
     if ratio:
         return ratio.group(1).replace(" ", "")
-    size = re.search(r"\b(\d{3,5}\s*x\s*\d{3,5})\b", text, re.IGNORECASE)
+    size = re.search(r"(?<!\d)(\d{3,5}\s*x\s*\d{3,5})(?!\d)", text, re.IGNORECASE)
     if size:
         return size.group(1).replace(" ", "").lower()
     return ""

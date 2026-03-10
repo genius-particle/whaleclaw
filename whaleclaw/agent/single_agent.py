@@ -207,11 +207,33 @@ _IMAGE_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 _IMAGE_EDIT_FOLLOWUP_RE = re.compile(
-    r"(改(?:成|下|一下)?|修改|调整|优化|增强|变得|变成|换成|把.+(?:改|变))",
+    r"(改(?:成|下|一下)?|修改|调整|优化|增强|变得|变成|换成|把.+(?:改|变|改成|变成|换成)|"
+    r"让.+(?:改成|变成|换成)|"
+    r"加上|加个|加一(?:个|只)?|加只|添加|增加|补上|再来(?:个|只)?|放一(?:个|只)?)",
+    re.IGNORECASE,
+)
+_IMAGE_EDIT_SUBJECT_CONTINUATION_RE = re.compile(
+    r"^\s*(?:请)?(?:帮我)?(?:让|给)\s*(?:这|那|它|他|她)"
+    r"(?:只|个|头|名|位|条|匹|张|幅)?",
     re.IGNORECASE,
 )
 _IMAGE_REGENERATE_RE = re.compile(
     r"(重试|重做|重新生成|重生成|重新来|再来一版|再生成一次|再试一次|重画|这图不好看)",
+    re.IGNORECASE,
+)
+_NANO_BANANA_RATIO_CLAUSE_RE = re.compile(
+    r"[，,、;\s]*(?:图片)?(?:尺寸|比例|画幅|宽高比)"
+    r"(?:改成|改为|是|为|设为|设置为|调整为|调成|[:：])?\s*"
+    r"(?:\d{1,2}\s*:\s*\d{1,2}|\d{3,5}\s*[xX]\s*\d{3,5})",
+    re.IGNORECASE,
+)
+_NANO_BANANA_REGENERATE_PREFIX_RE = re.compile(
+    r"^\s*(?:请)?(?:帮我)?(?:再)?(?:重新生成|重生成|重试|再试一次|再生成一次|重新来|重做|重画)"
+    r"(?:一下|下)?[，,、:\s]*",
+    re.IGNORECASE,
+)
+_NANO_BANANA_MODEL_PREFIX_RE = re.compile(
+    r"^\s*(?:用|改用|切换到)?\s*(?:香蕉2|香蕉pro)\s*",
     re.IGNORECASE,
 )
 _EVOMAP_LINE_RE = re.compile(r"^\s*-\s*([^:]+):\s*(.+?)\s*$")
@@ -857,6 +879,8 @@ def _message_requests_image_edit(message: str) -> bool:
     """Detect edit follow-ups that should continue from the latest output image."""
     if _message_may_need_prior_images(message):
         return True
+    if _IMAGE_EDIT_SUBJECT_CONTINUATION_RE.search(message):
+        return True
     return bool(_IMAGE_EDIT_FOLLOWUP_RE.search(message))
 
 
@@ -1018,6 +1042,42 @@ def _strip_inline_image_markdown(text: str) -> str:
     return stripped.strip()
 
 
+def _clean_nano_banana_prompt_delta(message: str) -> str:
+    cleaned = _strip_inline_image_markdown(message).strip()
+    if not cleaned:
+        return ""
+    cleaned = _NANO_BANANA_MODEL_PREFIX_RE.sub("", cleaned)
+    cleaned = _NANO_BANANA_REGENERATE_PREFIX_RE.sub("", cleaned)
+    cleaned = _NANO_BANANA_RATIO_CLAUSE_RE.sub("", cleaned)
+    cleaned = re.sub(r"^[，,、；;：:\s]+", "", cleaned)
+    cleaned = re.sub(r"[，,、；;：:\s]+$", "", cleaned)
+    return cleaned.strip()
+
+
+def _merge_nano_banana_prompt(
+    *,
+    previous_prompt: str,
+    message: str,
+    regenerate: bool,
+    image_edit: bool,
+) -> str:
+    previous = _strip_inline_image_markdown(previous_prompt).strip()
+    delta = _clean_nano_banana_prompt_delta(message)
+    if not previous:
+        return delta
+    if not delta:
+        return previous
+    if delta in previous:
+        return previous
+    if regenerate or image_edit:
+        return (
+            f"{previous}\n\n"
+            "在保留原始主题、主体和核心场景设定的前提下，按以下要求重新生成或修改："
+            f"{delta}"
+        )
+    return delta
+
+
 def _recover_latest_generated_image_path(session: Session | None) -> str:
     if session is None:
         return ""
@@ -1044,6 +1104,25 @@ def _recover_last_input_image_paths(session: Session | None) -> list[str]:
     return output
 
 
+def _recover_last_nano_banana_mode(session: Session | None) -> str:
+    if session is None:
+        return ""
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    raw_mode = str(metadata.get("last_nano_banana_mode", "")).strip().lower()
+    if raw_mode in {"text", "edit"}:
+        return raw_mode
+    state_map_raw = metadata.get("skill_param_state", {})
+    if not isinstance(state_map_raw, dict):
+        return ""
+    nano_state_raw = state_map_raw.get("nano-banana-image-t8", {})
+    if not isinstance(nano_state_raw, dict):
+        return ""
+    state_mode = str(nano_state_raw.get("__last_mode__", "")).strip().lower()
+    if state_mode in {"text", "edit"}:
+        return state_mode
+    return ""
+
+
 def _resolve_nano_banana_input_paths(
     llm_message: str,
     session: Session | None,
@@ -1053,6 +1132,8 @@ def _resolve_nano_banana_input_paths(
     if explicit_paths:
         return explicit_paths
     if _message_requests_image_regenerate(llm_message):
+        if _recover_last_nano_banana_mode(session) == "text":
+            return []
         return _recover_last_input_image_paths(session)
     if _message_requests_image_edit(llm_message):
         latest_generated = _recover_latest_generated_image_path(session)
@@ -1064,6 +1145,7 @@ def _resolve_nano_banana_input_paths(
 
 def _build_nano_banana_command(
     *,
+    mode: str,
     model_display: str,
     prompt: str,
     input_paths: list[str],
@@ -1079,7 +1161,6 @@ def _build_nano_banana_command(
         / "scripts"
         / "test_nano_banana_2.py"
     )
-    mode = "edit" if input_paths else "text"
     parts = [
         "./python/bin/python3.12",
         shlex.quote(str(script_path)),
@@ -1094,6 +1175,8 @@ def _build_nano_banana_command(
         "--aspect-ratio",
         shlex.quote(ratio or "auto"),
     ]
+    if model_display == "香蕉pro":
+        parts.extend(["--image-size", "2K"])
     for path in input_paths:
         parts.extend(["--input-image", shlex.quote(path)])
     return " ".join(parts)
@@ -1545,10 +1628,7 @@ async def _sync_multi_agent_compression_boundary(
         return None
     try:
         await asyncio.wait_for(
-            session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-                session.id,
-                metadata=session.metadata,
-            ),
+            session_manager.update_metadata(session, session.metadata),
             timeout=1.5,
         )
         return None
@@ -2127,8 +2207,14 @@ async def run_agent(
             reuse_reason = ""
             skill_needs_images = _skill_requires_images(active_skills_for_images)
             if _message_requests_image_regenerate(llm_message):
-                recovered_images = _recover_last_input_images(session)
-                reuse_reason = "last_input_images"
+                if (
+                    "nano-banana-image-t8" in locked_skill_ids
+                    and _recover_last_nano_banana_mode(session) == "text"
+                ):
+                    recovered_images = []
+                else:
+                    recovered_images = _recover_last_input_images(session)
+                    reuse_reason = "last_input_images"
             elif _message_requests_image_edit(llm_message) and (
                 _message_may_need_prior_images(llm_message) or skill_needs_images
             ):
@@ -2145,8 +2231,10 @@ async def run_agent(
                     count=len(recovered_images),
                     reason=reuse_reason,
                 )
-        elif session is not None:
+        has_new_input_images = False
+        if session is not None:
             current_input_paths = _extract_input_image_paths_from_text(llm_message)
+            has_new_input_images = bool(current_input_paths)
             if current_input_paths:
                 session.metadata["last_input_image_paths"] = current_input_paths
                 metadata_dirty = True
@@ -2181,9 +2269,23 @@ async def run_agent(
                         guard.params, skill_state, llm_message, images
                     )
                     if skill.id == "nano-banana-image-t8":
+                        previous_prompt = str(skill_state.get("prompt", "")).strip()
                         control_message_only = _is_nano_banana_control_message(llm_message)
                         if control_message_only and "prompt" in updated:
                             updated["prompt"] = skill_state.get("prompt")
+                        elif has_new_input_images:
+                            cleaned_prompt = _clean_nano_banana_prompt_delta(llm_message)
+                            if cleaned_prompt:
+                                updated["prompt"] = cleaned_prompt
+                        else:
+                            merged_prompt = _merge_nano_banana_prompt(
+                                previous_prompt=previous_prompt,
+                                message=llm_message,
+                                regenerate=_message_requests_image_regenerate(llm_message),
+                                image_edit=_message_requests_image_edit(llm_message),
+                            )
+                            if merged_prompt:
+                                updated["prompt"] = merged_prompt
                         previous_model = str(
                             skill_state.get(
                                 "__model_display__",
@@ -2229,9 +2331,14 @@ async def run_agent(
                     ).strip() or _load_saved_nano_banana_model_display()
                     ratio = str(nano_state.get("ratio") or "auto").strip() or "auto"
                     input_paths = _resolve_nano_banana_input_paths(llm_message, session)
+                    mode = "edit" if input_paths else "text"
                     if input_paths:
                         session.metadata["last_input_image_paths"] = input_paths
+                    session.metadata["last_nano_banana_mode"] = mode
+                    if isinstance(nano_state, dict):
+                        nano_state["__last_mode__"] = mode
                     command = _build_nano_banana_command(
+                        mode=mode,
                         model_display=model_display,
                         prompt=prompt,
                         input_paths=input_paths,
@@ -3131,10 +3238,7 @@ async def run_agent(
             conversation.append(Message(role="user", content=prompt))
         final_text_parts.extend(post_round_update.final_texts)
         if metadata_dirty and session is not None and session_manager is not None:
-            await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-                session.id,
-                metadata=session.metadata,
-            )
+            await session_manager.update_metadata(session, session.metadata)
             metadata_dirty = False
         if post_round_update.stop_for_repeat_loop:
             break
@@ -3192,10 +3296,7 @@ async def run_agent(
         final_text = f"{final_text}\n\n{_lock_confirm_tip}" if final_text else _lock_confirm_tip
 
     if metadata_dirty and session is not None and session_manager is not None:
-        await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-            session.id,
-            metadata=session.metadata,
-        )
+        await session_manager.update_metadata(session, session.metadata)
 
     # Background: generate L0/L1 summaries for older messages if needed
     if (

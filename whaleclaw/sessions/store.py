@@ -15,6 +15,12 @@ log = get_logger(__name__)
 
 _DB_PATH = SESSIONS_DIR / "sessions.db"
 _GROUP_COMPRESSION_MAX_GROUPS = 300
+_PRESERVED_METADATA_KEYS = frozenset(
+    {
+        "group_compression_plan_levels",
+        "group_compression_pending",
+    }
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -268,6 +274,21 @@ class SessionStore:
         sql = f"UPDATE sessions SET {', '.join(parts)} WHERE id = ?"  # noqa: S608
         await self._conn.execute(sql, values)
         await self._conn.commit()
+
+    async def update_session_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, object],
+    ) -> dict[str, object]:
+        """Persist session metadata while preserving store-owned compression state."""
+        merged = dict(metadata)
+        current = await self.get_session(session_id)
+        if current is not None:
+            for key in _PRESERVED_METADATA_KEYS:
+                if key not in merged and key in current.metadata:
+                    merged[key] = current.metadata[key]
+        await self.update_session_field(session_id, metadata=merged)
+        return merged
 
     async def add_message(
         self,
