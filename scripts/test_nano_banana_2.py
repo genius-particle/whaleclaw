@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime
 import getpass
 import os
 import sys
@@ -95,6 +96,11 @@ def _extract_image_bytes(item: dict[str, Any], client: httpx.Client) -> bytes:
 def _save_image(data: bytes, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
+
+
+def _timestamped_output_path(out_dir: Path, prefix: str) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return out_dir / f"{prefix}_{stamp}.png"
 
 
 def run_text_to_image(
@@ -340,8 +346,8 @@ def main() -> int:
     args.edit_model = _normalize_model_name(str(args.edit_model)) or default_model
 
     out_dir = Path(args.out_dir)
-    text_output = out_dir / "text_to_image.png"
-    edit_output = out_dir / "image_to_image.png"
+    text_output = _timestamped_output_path(out_dir, "text_to_image")
+    edit_output = _timestamped_output_path(out_dir, "image_to_image")
 
     if args.model == args.edit_model:
         print(f"当前使用模型: {_display_model_name(args.model)}")

@@ -2739,7 +2739,7 @@ async def run_agent(
                     tc = ToolCall(
                         id="nano_banana_fixed_runner",
                         name="bash",
-                        arguments={"command": command, "timeout": 180},
+                        arguments={"command": command, "timeout": 330},
                     )
                     if session_manager is not None:
                         await _persist_message(

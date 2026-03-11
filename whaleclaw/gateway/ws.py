@@ -21,6 +21,7 @@ from whaleclaw.agent.single_agent import (
     is_multi_agent_discuss_done,
     run_agent,
 )
+from whaleclaw.config.paths import WHALECLAW_HOME
 from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.gateway.protocol import (
     MessageType,
@@ -54,6 +55,33 @@ log = get_logger(__name__)
 _active_connections: dict[str, WebSocket] = {}
 _SELF_HEAL_MARKER = "[system_self_heal]"
 _SELF_HEAL_RETRY_KEY = "self_heal_retries"
+_WS_UPLOAD_DIR = WHALECLAW_HOME / "uploads"
+
+
+def _image_suffix_for_mime(mime: str) -> str:
+    normalized = mime.strip().lower()
+    if normalized == "image/png":
+        return ".png"
+    if normalized == "image/webp":
+        return ".webp"
+    if normalized == "image/gif":
+        return ".gif"
+    return ".jpg"
+
+
+def _persist_ws_images(session_id: str, images: list[ImageContent]) -> tuple[list[str], str]:
+    """Persist inbound WebChat images so downstream skills can reference local paths."""
+    _WS_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    saved_paths: list[str] = []
+    markdown_lines = ["(用户发送了图片)"]
+    for index, image in enumerate(images, start=1):
+        suffix = _image_suffix_for_mime(image.mime or "image/png")
+        path = _WS_UPLOAD_DIR / f"ws_{session_id}_{uuid4().hex[:10]}{suffix}"
+        path.write_bytes(base64.b64decode(image.data))
+        normalized = str(path)
+        saved_paths.append(normalized)
+        markdown_lines.append(f"![WebChat图片{index}]({normalized})")
+    return saved_paths, "\n".join(markdown_lines)
 
 
 def _is_multi_agent_effective_for_session(
@@ -351,6 +379,9 @@ async def websocket_handler(
 
             if images:
                 log.debug("ws.images", count=len(images), session_id=session.id)
+                _saved_paths, image_markdown = _persist_ws_images(session.id, images)
+                content = (content or "").strip()
+                content = f"{content}\n\n{image_markdown}" if content else image_markdown
 
             cmd_result = await chat_cmd.handle(content, session) if content else None
             if cmd_result is not None:
