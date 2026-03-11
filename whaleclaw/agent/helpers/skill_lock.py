@@ -129,11 +129,21 @@ def build_nano_banana_execution_system_message(
     current_model: str,
     recent_image_paths: list[str],
 ) -> Message:
-    image_lines = (
-        "\n".join(f"- {path}" for path in recent_image_paths)
-        if recent_image_paths
-        else "- 当前没有可复用的历史图片路径"
-    )
+    if recent_image_paths:
+        alias_lines: list[str] = []
+        for index, path in enumerate(recent_image_paths):
+            if index == 0:
+                alias = "当前这张/最新一张"
+            elif index == 1:
+                alias = "上一张/前一张"
+            elif index == 2:
+                alias = "再上一张/上上张"
+            else:
+                alias = f"倒数第{index + 1}张"
+            alias_lines.append(f"- {alias}: {path}")
+        image_lines = "\n".join(alias_lines)
+    else:
+        image_lines = "- 当前没有可复用的历史图片路径"
     return Message(
         role="system",
         content=(
@@ -145,7 +155,8 @@ def build_nano_banana_execution_system_message(
             "2) 对外回复只使用展示名“香蕉2”或“香蕉pro”，除非用户明确追问，不要暴露底层模型标识。\n"
             "3) 若用户是在说“重试”“继续处理这张图”“改用香蕉pro重试”这类续跑语义，且没有上传新图，"
             "默认复用最近一轮可用图片，不要再要求用户重新上传。\n"
-            "4) 当前可直接复用的历史图片绝对路径如下：\n"
+            "4) 图片引用规则：当前这张=最新一张；上一张=倒数第二张；再上一张=倒数第三张。\n"
+            "5) 当前可直接复用的历史图片绝对路径如下：\n"
             f"{image_lines}"
         ),
     )
@@ -360,6 +371,11 @@ _NANO_BANANA_CONTROL_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     re.compile(
         r"^(?:切换|切换到|改用|换成|默认模型)\s*(?:香蕉2|香蕉pro)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:(?:不对[呀啊]?[,，\s]*)?(?:我的|当前)?(?:默认)?模型(?:应该是|改成|换成|切换到)?\s*"
+        r"(?:香蕉2|香蕉pro)(?:[呀啊哦呢吧嘛]*)?)\s*$",
         re.IGNORECASE,
     ),
     re.compile(

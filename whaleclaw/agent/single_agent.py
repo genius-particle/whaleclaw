@@ -105,9 +105,6 @@ from whaleclaw.agent.helpers.skill_lock import (
     is_nano_banana_control_message as _is_nano_banana_control_message,
 )
 from whaleclaw.agent.helpers.skill_lock import (
-    is_skill_switch_consent as _is_skill_switch_consent,
-)
-from whaleclaw.agent.helpers.skill_lock import (
     is_task_done_confirmation as _is_task_done_confirmation,
 )
 from whaleclaw.agent.helpers.skill_lock import (
@@ -235,6 +232,57 @@ _NANO_BANANA_REGENERATE_PREFIX_RE = re.compile(
 _NANO_BANANA_MODEL_PREFIX_RE = re.compile(
     r"^\s*(?:用|改用|切换到)?\s*(?:香蕉2|香蕉pro)\s*",
     re.IGNORECASE,
+)
+_PREVIOUS_IMAGE_REF_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
+    (2, re.compile(r"(?:再上一张|上上张|前前一张)图?", re.IGNORECASE)),
+    (1, re.compile(r"(?:上一张|前一张)图?", re.IGNORECASE)),
+    (0, re.compile(r"(?:当前这张|最新一张|这张图|这幅图)")),
+)
+_IMAGE_LOOKUP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:长啥样|什么样|是哪张|发(?:来)?看|看一下|看看|给我看)"),
+    re.compile(r"^(?:那)?(?:再)?(?:上[一二两]?张|前[一二两]?张|这张)呢[？?]?$"),
+)
+_MAX_IMAGE_REFERENCE_HISTORY = 6
+_NANO_BANANA_TEXT_TO_IMAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:文生图|生图|出图|作画)", re.IGNORECASE),
+    re.compile(
+        r"(?:生成|做|做个|做张|画|来|给我|帮我)(?:一张|个|张)?(?:图|图片|海报|插画)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:这是一张|一张).+(?:的图|图片|海报|插画)", re.IGNORECASE),
+)
+_NANO_BANANA_NON_EXECUTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^\s*(?:你好|嗨|hi|hello|在吗|早上好|中午好|晚上好)\s*[!！,.。]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:谢谢|谢了|多谢|辛苦了|拜拜|再见|晚安)\s*[!！,.。]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:请)?(?:给我|给咱|给大家|来个|讲个|讲一个|说个|说一个)?"
+        r"(?:笑话|段子|故事|脑筋急转弯)(?:吧|呀|啊|呗)?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:聊聊|聊一聊|继续聊|继续说|解释一下|介绍一下|分析一下|总结一下|"
+        r"告诉我|回答我|帮我解释|帮我分析|帮我总结|怎么看|为什么|怎么|是什么)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:桌面截图|截个图|截图给我|屏幕截图|桌面|desktop|screenshot|截屏)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:做个PPT|制作PPT|生成PPT|幻灯片|文档|表格|excel|word|pptx?|docx?|xlsx?)",
+        re.IGNORECASE,
+    ),
+)
+_NANO_BANANA_PROMPT_QUESTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"[?？]"),
+    re.compile(r"(?:什么|为何|为什么|怎么|如何|哪个|哪张|哪一张|是不是|是否|吗|呢)\s*$"),
+    re.compile(r"(?:什么样|长啥样|发来看看|给我看|看一下|看看)"),
 )
 _EVOMAP_LINE_RE = re.compile(r"^\s*-\s*([^:]+):\s*(.+?)\s*$")
 _VERSION_SUFFIX_RE = re.compile(r"_V\d+$", re.IGNORECASE)
@@ -961,6 +1009,29 @@ def _recover_latest_generated_image(session: Session | None) -> list[ImageConten
     return _load_images_from_paths([latest_generated])
 
 
+def _append_image_reference_history(metadata: dict[str, object], paths: list[str]) -> bool:
+    raw_history = metadata.get("image_reference_history", [])
+    history: list[str] = []
+    if isinstance(raw_history, list):
+        history = [str(item).strip() for item in raw_history if str(item).strip()]
+    changed = False
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            continue
+        normalized = str(path)
+        if normalized in history:
+            history.remove(normalized)
+        history.insert(0, normalized)
+        changed = True
+    if len(history) > _MAX_IMAGE_REFERENCE_HISTORY:
+        history = history[:_MAX_IMAGE_REFERENCE_HISTORY]
+        changed = True
+    if changed:
+        metadata["image_reference_history"] = history
+    return changed
+
+
 def _recover_last_input_images(session: Session | None) -> list[ImageContent]:
     """Return the last explicit input image set for regenerate-followup turns."""
     if session is None:
@@ -986,6 +1057,17 @@ def _recover_recent_session_image_paths(
     seen_paths: set[str] = set()
 
     metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    history_raw = metadata.get("image_reference_history", [])
+    if isinstance(history_raw, list):
+        for item in history_raw:
+            path = Path(str(item).strip()).expanduser()
+            resolved = str(path)
+            if resolved in seen_paths or not path.is_file():
+                continue
+            seen_paths.add(resolved)
+            recovered.append(resolved)
+            if len(recovered) >= limit:
+                return recovered
     latest_generated = str(metadata.get("last_generated_image_path", "")).strip()
     if latest_generated:
         path = Path(latest_generated).expanduser()
@@ -1010,6 +1092,69 @@ def _recover_recent_session_image_paths(
             if len(recovered) >= limit:
                 return recovered
     return recovered
+
+
+def _resolve_relative_image_reference_index(message: str) -> int | None:
+    for index, pattern in _PREVIOUS_IMAGE_REF_PATTERNS:
+        if pattern.search(message):
+            return index
+    return None
+
+
+def _resolve_relative_image_reference_path(
+    session: Session | None,
+    message: str,
+) -> str:
+    ref_index = _resolve_relative_image_reference_index(message)
+    if ref_index is None:
+        return ""
+    history = _recover_recent_session_image_paths(session, limit=max(4, ref_index + 1))
+    if ref_index >= len(history):
+        return ""
+    return history[ref_index]
+
+
+def _is_image_reference_lookup_message(message: str) -> bool:
+    if _is_nano_banana_execution_request(message=message, has_new_input_images=False):
+        return False
+    if _resolve_relative_image_reference_index(message) is None:
+        return False
+    return any(pattern.search(message) for pattern in _IMAGE_LOOKUP_PATTERNS)
+
+
+def _raw_skill_trigger_mentioned(skill: Skill, text: str) -> bool:
+    lower = text.lower()
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", lower)
+    for raw in skill.triggers:
+        trigger = raw.strip().lower()
+        if not trigger:
+            continue
+        if trigger in lower:
+            return True
+        compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", trigger)
+        if compact and compact in normalized:
+            return True
+    return False
+
+
+def _lockable_skill_ids(skills: list[Skill]) -> list[str]:
+    return _normalize_skill_ids([skill for skill in skills if skill.lock_session])
+
+
+def _looks_like_nano_banana_prompt_text(message: str) -> bool:
+    stripped = message.strip()
+    if not stripped:
+        return False
+    if any(pattern.search(stripped) for pattern in _NANO_BANANA_PROMPT_QUESTION_PATTERNS):
+        return False
+    if any(pattern.search(stripped) for pattern in _NANO_BANANA_NON_EXECUTION_PATTERNS):
+        return False
+    compact = re.sub(r"[\s，,。.!！;；:：、】【（）()\"'“”‘’]+", "", stripped)
+    if len(compact) < 6:
+        return False
+    return not bool(
+        re.search(r"(?:技能|skill|模型|api|key|路径|网址|链接|PPT|ppt|文档|表格)", stripped)
+    )
 
 
 def _extract_input_image_paths_from_text(
@@ -1123,6 +1268,26 @@ def _recover_last_nano_banana_mode(session: Session | None) -> str:
     return ""
 
 
+def _resolve_nano_banana_model_display(session: Session | None) -> str:
+    default_model = _load_saved_nano_banana_model_display()
+    if session is None:
+        return default_model
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    recent_model = str(metadata.get("last_nano_banana_model_display", "")).strip()
+    if recent_model in {"香蕉2", "香蕉pro"}:
+        return recent_model
+    state_map_raw = metadata.get("skill_param_state", {})
+    if not isinstance(state_map_raw, dict):
+        return default_model
+    nano_state_raw = state_map_raw.get("nano-banana-image-t8", {})
+    if not isinstance(nano_state_raw, dict):
+        return default_model
+    state_model = str(nano_state_raw.get("__model_display__", "")).strip()
+    if state_model in {"香蕉2", "香蕉pro"}:
+        return state_model
+    return default_model
+
+
 def _resolve_nano_banana_input_paths(
     llm_message: str,
     session: Session | None,
@@ -1131,6 +1296,9 @@ def _resolve_nano_banana_input_paths(
     explicit_paths = _extract_input_image_paths_from_text(llm_message)
     if explicit_paths:
         return explicit_paths
+    relative_path = _resolve_relative_image_reference_path(session, llm_message)
+    if relative_path:
+        return [relative_path]
     if _message_requests_image_regenerate(llm_message):
         if _recover_last_nano_banana_mode(session) == "text":
             return []
@@ -1141,6 +1309,42 @@ def _resolve_nano_banana_input_paths(
             return [latest_generated]
         return _recover_last_input_image_paths(session)
     return []
+
+
+def _is_nano_banana_execution_request(
+    *,
+    message: str,
+    has_new_input_images: bool,
+) -> bool:
+    stripped = message.strip()
+    if not stripped:
+        return has_new_input_images
+    if has_new_input_images:
+        return True
+    if _is_nano_banana_control_message(stripped):
+        return False
+    if _is_task_done_confirmation(stripped, task_done_patterns=_TASK_DONE_PATTERNS):
+        return False
+    if any(pattern.search(stripped) for pattern in _NANO_BANANA_NON_EXECUTION_PATTERNS):
+        return False
+    if (
+        any(pattern.search(stripped) for pattern in _NANO_BANANA_PROMPT_QUESTION_PATTERNS)
+        and not _message_requests_image_regenerate(stripped)
+        and not any(pattern.search(stripped) for pattern in _NANO_BANANA_TEXT_TO_IMAGE_PATTERNS)
+        and not _IMAGE_EDIT_FOLLOWUP_RE.search(stripped)
+    ):
+        return False
+    if _message_requests_image_regenerate(stripped):
+        return True
+    if _message_requests_image_edit(stripped):
+        return True
+    if any(pattern.search(stripped) for pattern in _NANO_BANANA_TEXT_TO_IMAGE_PATTERNS):
+        return True
+    if _is_image_generation_request(stripped):
+        return True
+    if _looks_like_nano_banana_prompt_text(stripped):
+        return True
+    return True
 
 
 def _build_nano_banana_command(
@@ -2014,25 +2218,10 @@ async def run_agent(
                 pending_switch_message = raw_pending_switch_message.strip()
 
         if pending_switch_skill_ids and pending_switch_message:
-            if _is_skill_switch_consent(
+            if _is_task_done_confirmation(
                 message,
-                skill_switch_consent_patterns=_SKILL_SWITCH_CONSENT_PATTERNS,
+                task_done_patterns=_TASK_DONE_PATTERNS,
             ):
-                previous_locked_skill_ids = list(locked_skill_ids)
-                locked_skill_ids = pending_switch_skill_ids
-                lock_is_explicit = True
-                lock_waiting_done = False
-                skill_announce_pending = True
-                llm_message = pending_switch_message
-                if session is not None:
-                    session.metadata["locked_skill_ids"] = locked_skill_ids
-                    session.metadata["skill_lock_waiting_done"] = False
-                    session.metadata["skill_lock_announce_pending"] = True
-                    session.metadata.pop("pending_skill_switch_ids", None)
-                    session.metadata.pop("pending_skill_switch_message", None)
-                    metadata_dirty = True
-            elif any(pattern.search(message.strip()) for pattern in _SKILL_SWITCH_KEEP_PATTERNS):
-                llm_message = pending_switch_message
                 if session is not None:
                     session.metadata.pop("pending_skill_switch_ids", None)
                     session.metadata.pop("pending_skill_switch_message", None)
@@ -2042,8 +2231,8 @@ async def run_agent(
                 current_skills = "、".join(locked_skill_ids)
                 return (
                     f"当前会话仍锁定在 {current_skills} 技能。"
-                    f"如果你确实要切换到 {requested_skills}，请明确回复“同意切换技能”；"
-                    "如果要继续原流程，请回复“继续沿用原技能”。"
+                    f"如果你确实要切换到 {requested_skills}，请先回复“任务完成”，"
+                    "之后再重新输入目标命令。"
                 )
 
         if (
@@ -2051,21 +2240,21 @@ async def run_agent(
             and "nano-banana-image-t8" in locked_skill_ids
             and _is_nano_banana_activation_message(message)
         ):
-            model_display = _load_saved_nano_banana_model_display()
-            if session is not None:
-                state_map_raw = session.metadata.get("skill_param_state", {})
-                if isinstance(state_map_raw, dict):
-                    nano_state = state_map_raw.get("nano-banana-image-t8")
-                    if isinstance(nano_state, dict):
-                        model_display = str(
-                            nano_state.get("__model_display__", model_display)
-                        ).strip() or model_display
+            model_display = _resolve_nano_banana_model_display(session)
             return (
                 "当前会话仍在香蕉生图技能里。"
                 f"当前模型：{model_display}。\n"
                 "如果要继续生图，请直接发送提示词或图片；"
                 "如果本轮已结束，请回复“任务完成”解除技能锁定。"
             )
+        if (
+            lock_is_explicit
+            and "nano-banana-image-t8" in locked_skill_ids
+            and _is_image_reference_lookup_message(llm_message)
+        ):
+            ref_path = _resolve_relative_image_reference_path(session, llm_message)
+            if ref_path:
+                return f"你说的这张是：\n路径：{ref_path}\n\n![历史图片]({ref_path})"
 
         use_cmd = _parse_use_command(message, use_cmd_re=_USE_CMD_RE)
         if use_cmd is not None:
@@ -2087,16 +2276,26 @@ async def run_agent(
                 if remainder:
                     llm_message = remainder
             else:
-                locked_skill_ids = use_skill_ids
-                lock_is_explicit = True
+                forced_skills = _assembler.route_skills(
+                    remainder or message,
+                    forced_skill_ids=use_skill_ids,
+                )
+                lockable_use_skill_ids = _lockable_skill_ids(forced_skills)
+                locked_skill_ids = lockable_use_skill_ids
+                lock_is_explicit = bool(lockable_use_skill_ids)
                 lock_waiting_done = False
-                skill_announce_pending = True
+                skill_announce_pending = bool(lockable_use_skill_ids)
                 if session is not None:
-                    session.metadata["locked_skill_ids"] = locked_skill_ids
-                    session.metadata["skill_lock_waiting_done"] = False
-                    session.metadata["skill_lock_announce_pending"] = True
+                    if lockable_use_skill_ids:
+                        session.metadata["locked_skill_ids"] = locked_skill_ids
+                        session.metadata["skill_lock_waiting_done"] = False
+                        session.metadata["skill_lock_announce_pending"] = True
+                    else:
+                        session.metadata.pop("locked_skill_ids", None)
+                        session.metadata.pop("skill_lock_waiting_done", None)
+                        session.metadata.pop("skill_lock_announce_pending", None)
                     metadata_dirty = True
-                llm_message = remainder or f"使用技能 {', '.join(locked_skill_ids)} 处理当前请求。"
+                llm_message = remainder or f"使用技能 {', '.join(use_skill_ids)} 处理当前请求。"
         elif lock_is_explicit and locked_skill_ids and _is_task_done_confirmation(
             message,
             task_done_patterns=_TASK_DONE_PATTERNS,
@@ -2134,6 +2333,7 @@ async def run_agent(
 
         routed_skills = _assembler.route_skills(llm_message)
         routed_skill_ids = _normalize_skill_ids(routed_skills)
+        lockable_routed_skill_ids = _lockable_skill_ids(routed_skills)
 
         if (
             not locked_skill_ids
@@ -2146,17 +2346,17 @@ async def run_agent(
                 or any(_skill_trigger_mentioned(skill, message) for skill in routed_skills)
             )
         ):
-            locked_skill_ids = routed_skill_ids
-            lock_is_explicit = True
+            locked_skill_ids = lockable_routed_skill_ids
+            lock_is_explicit = bool(lockable_routed_skill_ids)
             lock_waiting_done = False
-            skill_announce_pending = True
-            if session is not None:
+            skill_announce_pending = bool(lockable_routed_skill_ids)
+            if session is not None and lockable_routed_skill_ids:
                 session.metadata["locked_skill_ids"] = locked_skill_ids
                 session.metadata["skill_lock_waiting_done"] = False
                 session.metadata["skill_lock_announce_pending"] = True
                 metadata_dirty = True
-        elif not locked_skill_ids and routed_skill_ids:
-            pending_lock_skill_ids = routed_skill_ids
+        elif not locked_skill_ids and lockable_routed_skill_ids:
+            pending_lock_skill_ids = lockable_routed_skill_ids
 
         if (
             lock_is_explicit
@@ -2165,25 +2365,17 @@ async def run_agent(
             and routed_skill_ids != locked_skill_ids
         ):
             switch_requested = any(
-                _skill_explicitly_mentioned(skill, message)
+                (
+                    _skill_explicitly_mentioned(skill, message)
+                    or _skill_trigger_mentioned(skill, message)
+                    or _raw_skill_trigger_mentioned(skill, message)
+                )
                 for skill in routed_skills
                 if skill.id.strip().lower() not in set(locked_skill_ids)
             )
             if not switch_requested:
                 routed_skill_ids = []
                 routed_skills = []
-            elif _is_skill_switch_consent(
-                message,
-                skill_switch_consent_patterns=_SKILL_SWITCH_CONSENT_PATTERNS,
-            ):
-                locked_skill_ids = routed_skill_ids
-                lock_waiting_done = False
-                skill_announce_pending = True
-                if session is not None:
-                    session.metadata["locked_skill_ids"] = locked_skill_ids
-                    session.metadata["skill_lock_waiting_done"] = False
-                    session.metadata["skill_lock_announce_pending"] = True
-                    metadata_dirty = True
             else:
                 requested_skills = "、".join(routed_skill_ids)
                 current_skills = "、".join(locked_skill_ids)
@@ -2193,8 +2385,8 @@ async def run_agent(
                     metadata_dirty = True
                 return (
                     f"当前会话仍锁定在 {current_skills} 技能。"
-                    f"如果你确实要切换到 {requested_skills}，请明确回复“同意切换技能”；"
-                    "如果要继续原流程，请回复“继续沿用原技能”。"
+                    f"如果你确实要切换到 {requested_skills}，请先回复“任务完成”，"
+                    "之后再重新输入目标命令。"
                 )
 
         active_skills_for_images = routed_skills
@@ -2237,10 +2429,38 @@ async def run_agent(
             has_new_input_images = bool(current_input_paths)
             if current_input_paths:
                 session.metadata["last_input_image_paths"] = current_input_paths
+                _append_image_reference_history(session.metadata, current_input_paths)
                 metadata_dirty = True
+        nano_banana_control_only = (
+            lock_is_explicit
+            and "nano-banana-image-t8" in locked_skill_ids
+            and _is_nano_banana_control_message(llm_message)
+        )
+        nano_banana_execution_request = _is_nano_banana_execution_request(
+            message=llm_message,
+            has_new_input_images=has_new_input_images,
+        )
+        if (
+            lock_is_explicit
+            and "nano-banana-image-t8" in locked_skill_ids
+            and not nano_banana_control_only
+            and not nano_banana_execution_request
+        ):
+            active_skills_for_images = []
+        skip_nano_banana_guard = (
+            lock_is_explicit
+            and "nano-banana-image-t8" in locked_skill_ids
+            and not nano_banana_control_only
+            and not nano_banana_execution_request
+        )
 
         if lock_is_explicit and locked_skill_ids and not lock_waiting_done and session is not None:
-            locked_skills = _assembler.route_skills(llm_message, forced_skill_ids=locked_skill_ids)
+            forced_skill_ids = locked_skill_ids
+            if skip_nano_banana_guard:
+                forced_skill_ids = [
+                    skill_id for skill_id in locked_skill_ids if skill_id != "nano-banana-image-t8"
+                ]
+            locked_skills = _assembler.route_skills(llm_message, forced_skill_ids=forced_skill_ids)
             guards = _guarded_skills(locked_skills)
             if guards:
                 state_map_raw = session.metadata.get("skill_param_state")
@@ -2269,8 +2489,11 @@ async def run_agent(
                         guard.params, skill_state, llm_message, images
                     )
                     if skill.id == "nano-banana-image-t8":
+                        if skip_nano_banana_guard:
+                            state_map[skill.id] = skill_state
+                            continue
                         previous_prompt = str(skill_state.get("prompt", "")).strip()
-                        control_message_only = _is_nano_banana_control_message(llm_message)
+                        control_message_only = nano_banana_control_only
                         if control_message_only and "prompt" in updated:
                             updated["prompt"] = skill_state.get("prompt")
                         elif has_new_input_images:
@@ -2296,6 +2519,9 @@ async def run_agent(
                             llm_message,
                             previous=previous_model,
                         )
+                        session.metadata["last_nano_banana_model_display"] = str(
+                            updated["__model_display__"]
+                        ).strip() or previous_model
                         missing = _nano_banana_missing_required(
                             updated,
                             control_message_only=control_message_only,
@@ -2304,6 +2530,23 @@ async def run_agent(
                     missing_any = missing_any or missing
                 session.metadata["skill_param_state"] = state_map
                 metadata_dirty = True
+                if (
+                    "nano-banana-image-t8" in forced_skill_ids
+                    and nano_banana_control_only
+                ):
+                    if session_manager is not None:
+                        await session_manager.update_metadata(session, session.metadata)
+                    model_display = str(
+                        state_map.get("nano-banana-image-t8", {}).get(
+                            "__model_display__",
+                            _resolve_nano_banana_model_display(session),
+                        )
+                    ).strip() or _resolve_nano_banana_model_display(session)
+                    return (
+                        f"已切换本次生图模型为：{model_display}。\n"
+                        "如需继续生图，请直接发送提示词或图片；"
+                        "如本轮任务已结束，请回复“任务完成”解除技能锁定。"
+                    )
                 if missing_any:
                     if session_manager is not None:
                         await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
@@ -2320,6 +2563,7 @@ async def run_agent(
                     return "\n\n".join(blocks)
                 if (
                     "nano-banana-image-t8" in locked_skill_ids
+                    and nano_banana_execution_request
                     and registry.get("bash") is not None
                 ):
                     nano_state = state_map.get("nano-banana-image-t8", {})
@@ -2327,14 +2571,19 @@ async def run_agent(
                         str(nano_state.get("prompt", "")).strip()
                     )
                     model_display = str(
-                        nano_state.get("__model_display__", _load_saved_nano_banana_model_display())
-                    ).strip() or _load_saved_nano_banana_model_display()
+                        nano_state.get(
+                            "__model_display__",
+                            _resolve_nano_banana_model_display(session),
+                        )
+                    ).strip() or _resolve_nano_banana_model_display(session)
                     ratio = str(nano_state.get("ratio") or "auto").strip() or "auto"
                     input_paths = _resolve_nano_banana_input_paths(llm_message, session)
                     mode = "edit" if input_paths else "text"
                     if input_paths:
                         session.metadata["last_input_image_paths"] = input_paths
+                        _append_image_reference_history(session.metadata, input_paths)
                     session.metadata["last_nano_banana_mode"] = mode
+                    session.metadata["last_nano_banana_model_display"] = model_display
                     if isinstance(nano_state, dict):
                         nano_state["__last_mode__"] = mode
                     command = _build_nano_banana_command(
@@ -2383,6 +2632,7 @@ async def run_agent(
                         image_path = _parse_nano_banana_result_path(result.output or "")
                         if image_path and Path(image_path).expanduser().is_file():
                             session.metadata["last_generated_image_path"] = image_path
+                            _append_image_reference_history(session.metadata, [image_path])
                         session.metadata["locked_skill_ids"] = locked_skill_ids
                         session.metadata["skill_lock_waiting_done"] = True
                         if session_manager is not None:
@@ -2577,18 +2827,7 @@ async def run_agent(
     if lock_is_explicit and locked_skill_ids:
         system_messages.append(_build_skill_lock_system_message(locked_skill_ids))
         if "nano-banana-image-t8" in locked_skill_ids:
-            skill_state_raw = (
-                session.metadata.get("skill_param_state", {})
-                if session is not None
-                else {}
-            )
-            current_model = _load_saved_nano_banana_model_display()
-            if isinstance(skill_state_raw, dict):
-                nano_state = skill_state_raw.get("nano-banana-image-t8")
-                if isinstance(nano_state, dict):
-                    current_model = str(
-                        nano_state.get("__model_display__", current_model)
-                    ).strip() or current_model
+            current_model = _resolve_nano_banana_model_display(session)
             system_messages.append(
                 _build_nano_banana_execution_system_message(
                     current_model,
@@ -3150,6 +3389,7 @@ async def run_agent(
                         and session.metadata.get("last_generated_image_path") != image_path
                     ):
                         session.metadata["last_generated_image_path"] = image_path
+                        _append_image_reference_history(session.metadata, [image_path])
                         metadata_dirty = True
             elif result.success:
                 successful_tool_calls += 1
