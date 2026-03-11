@@ -4363,6 +4363,73 @@ async def test_nano_banana_control_message_switches_model_without_running_genera
 
 
 @pytest.mark.asyncio
+async def test_nano_banana_model_switch_phrase_does_not_run_generator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图", "香蕉pro"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+            ],
+        ),
+        source_path=Path("/tmp/nano_switch_model_phrase.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill] if forced_skill_ids else [],  # noqa: ARG005
+    )
+
+    output_path = tmp_path / "text_to_image.png"
+    output_path.write_bytes(b"out")
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    registry = ToolRegistry()
+    bash_tool = _NanoBananaFixedRunnerTool(output_path)
+    registry.register(bash_tool)
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-switch-model-phrase",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "生成一张海报",
+                    "__model_display__": "香蕉2",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="模型切换香蕉Pro",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    assert "已切换本次生图模型为：香蕉pro" in result
+    assert bash_tool.commands == []
+
+
+@pytest.mark.asyncio
 async def test_nano_banana_activation_message_uses_guard_reply_after_unlock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

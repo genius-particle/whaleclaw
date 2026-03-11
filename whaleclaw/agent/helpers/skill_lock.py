@@ -375,6 +375,14 @@ _NANO_BANANA_CONTROL_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(
+        r"^(?:模型)?(?:切换|改成|换成)\s*(?:香蕉2|香蕉pro)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:切换|改用|换成)\s*模型\s*(?:香蕉2|香蕉pro)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
         r"^(?:(?:不对[呀啊]?[,，\s]*)?(?:我的|当前)?(?:默认)?模型(?:应该是|改成|换成|切换到)?\s*"
         r"(?:香蕉2|香蕉pro)(?:[呀啊哦呢吧嘛]*)?)\s*$",
         re.IGNORECASE,
