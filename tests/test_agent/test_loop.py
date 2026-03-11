@@ -3433,6 +3433,38 @@ async def test_resolve_nano_banana_input_paths_uses_previous_history_reference(
 
 
 @pytest.mark.asyncio
+async def test_resolve_nano_banana_input_paths_uses_numbered_uploaded_images(
+    tmp_path: Path,
+) -> None:
+    first_path = tmp_path / "first.png"
+    first_path.write_bytes(b"first")
+    second_path = tmp_path / "second.png"
+    second_path.write_bytes(b"second")
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-numbered-input-ref",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "last_input_image_paths": [str(first_path), str(second_path)],
+            "last_nano_banana_mode": "edit",
+        },
+    )
+
+    resolved = loop_mod._resolve_nano_banana_input_paths(  # noqa: SLF001
+        "让图1的女子穿着图2的衣服，站在一望无际的沙漠中",
+        session,
+    )
+
+    assert resolved == [str(first_path), str(second_path)]
+
+
+@pytest.mark.asyncio
 async def test_run_agent_regenerate_merges_new_prompt_delta_for_text_nano_banana(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4407,6 +4439,150 @@ async def test_nano_banana_activation_message_uses_guard_reply_after_unlock(
     assert "提示词：未提供" in result
     assert "请补充：" in result
     router.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_keeps_locked_nano_banana_for_numbered_image_reference_edit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nano_skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图", "香蕉文生图", "香蕉图生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(key="images", type="images", required=False, min_count=1),
+            ],
+        ),
+        source_path=Path("/tmp/nano_numbered_ref.md"),
+    )
+    search_skill = Skill(
+        id="search_images",
+        name="搜索并下载图片",
+        triggers=["图片", "照片", "搜图", "找图"],
+        instructions="x",
+        lock_session=False,
+        source_path=Path("/tmp/search_images.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [nano_skill]
+        if forced_skill_ids
+        else [search_skill, nano_skill],  # noqa: ARG005
+    )
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-numbered-image-ref",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "旧提示词",
+                    "images": 2,
+                    "__model_display__": "香蕉2",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="让图1的女子穿着图2的衣服，站在一望无际的草原里",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "如果你确实要切换到 search_images" not in result
+    assert "当前会话仍锁定在 nano-banana-image-t8 技能" not in result
+
+
+@pytest.mark.asyncio
+async def test_run_agent_keeps_locked_nano_banana_for_regenerate_followup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nano_skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图", "香蕉文生图", "香蕉图生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(key="api_key", type="api_key", required=True),
+                SkillParamItem(key="prompt", type="text", required=True),
+                SkillParamItem(key="images", type="images", required=False, min_count=1),
+            ],
+        ),
+        source_path=Path("/tmp/nano_regenerate_followup.md"),
+    )
+    search_skill = Skill(
+        id="search_images",
+        name="搜索并下载图片",
+        triggers=["图片", "照片", "搜图", "找图"],
+        instructions="x",
+        lock_session=False,
+        source_path=Path("/tmp/search_images_regen.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [nano_skill]
+        if forced_skill_ids
+        else [search_skill, nano_skill],  # noqa: ARG005
+    )
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-regenerate-followup",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "last_nano_banana_mode": "edit",
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "让图1和图2组合",
+                    "images": 2,
+                    "__model_display__": "香蕉2",
+                    "__last_mode__": "edit",
+                }
+            },
+        },
+    )
+
+    result = await run_agent(
+        message="重新生成，让图片充满电影感",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "如果你确实要切换到 search_images" not in result
+    assert "当前会话仍锁定在 nano-banana-image-t8 技能" not in result
 
 
 @pytest.mark.asyncio

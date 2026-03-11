@@ -203,6 +203,10 @@ _IMAGE_REFERENCE_RE = re.compile(
     r"(这张图|这张图片|这幅图|这幅图片|图里|图中|参考图|按这张|基于这张|用这张)",
     re.IGNORECASE,
 )
+_NUMBERED_IMAGE_REFERENCE_RE = re.compile(
+    r"(?:图\s*[1-9一二三四五六七八九两]|第[一二三四五六七八九两123456789]+张图)",
+    re.IGNORECASE,
+)
 _IMAGE_EDIT_FOLLOWUP_RE = re.compile(
     r"(改(?:成|下|一下)?|修改|调整|优化|增强|变得|变成|换成|把.+(?:改|变|改成|变成|换成)|"
     r"让.+(?:改成|变成|换成)|"
@@ -237,6 +241,10 @@ _PREVIOUS_IMAGE_REF_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
     (2, re.compile(r"(?:再上一张|上上张|前前一张)图?", re.IGNORECASE)),
     (1, re.compile(r"(?:上一张|前一张)图?", re.IGNORECASE)),
     (0, re.compile(r"(?:当前这张|最新一张|这张图|这幅图)")),
+)
+_NUMBERED_IMAGE_TOKEN_RE = re.compile(
+    r"(?:图\s*([1-9])|第([123456789一二三四五六七八九两])张图)",
+    re.IGNORECASE,
 )
 _IMAGE_LOOKUP_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:长啥样|什么样|是哪张|发(?:来)?看|看一下|看看|给我看)"),
@@ -932,6 +940,8 @@ def _message_requests_image_edit(message: str) -> bool:
     """Detect edit follow-ups that should continue from the latest output image."""
     if _message_may_need_prior_images(message):
         return True
+    if _NUMBERED_IMAGE_REFERENCE_RE.search(message):
+        return True
     if _IMAGE_EDIT_SUBJECT_CONTINUATION_RE.search(message):
         return True
     return bool(_IMAGE_EDIT_FOLLOWUP_RE.search(message))
@@ -1152,6 +1162,58 @@ def _resolve_relative_image_reference_index(message: str) -> int | None:
     return None
 
 
+def _number_token_to_index(token: str) -> int | None:
+    normalized = token.strip()
+    if not normalized:
+        return None
+    if normalized.isdigit():
+        value = int(normalized)
+        return value - 1 if value > 0 else None
+    zh_map = {
+        "一": 0,
+        "二": 1,
+        "两": 1,
+        "三": 2,
+        "四": 3,
+        "五": 4,
+        "六": 5,
+        "七": 6,
+        "八": 7,
+        "九": 8,
+    }
+    return zh_map.get(normalized)
+
+
+def _extract_numbered_image_reference_indexes(message: str) -> list[int]:
+    indexes: list[int] = []
+    seen: set[int] = set()
+    for match in _NUMBERED_IMAGE_TOKEN_RE.finditer(message):
+        token = match.group(1) or match.group(2) or ""
+        index = _number_token_to_index(token)
+        if index is None or index in seen:
+            continue
+        seen.add(index)
+        indexes.append(index)
+    return indexes
+
+
+def _resolve_numbered_input_image_paths(
+    session: Session | None,
+    message: str,
+) -> list[str]:
+    indexes = _extract_numbered_image_reference_indexes(message)
+    if not indexes:
+        return []
+    candidates = _recover_last_input_image_paths(session)
+    if not candidates:
+        return []
+    resolved: list[str] = []
+    for index in indexes:
+        if 0 <= index < len(candidates):
+            resolved.append(candidates[index])
+    return resolved
+
+
 def _resolve_relative_image_reference_path(
     session: Session | None,
     message: str,
@@ -1186,6 +1248,13 @@ def _raw_skill_trigger_mentioned(skill: Skill, text: str) -> bool:
         if compact and compact in normalized:
             return True
     return False
+
+
+def _is_numbered_image_reference_edit_message(text: str) -> bool:
+    """Return whether the message is describing an edit across numbered image refs."""
+    if not _NUMBERED_IMAGE_REFERENCE_RE.search(text):
+        return False
+    return _message_requests_image_edit(text)
 
 
 def _lockable_skill_ids(skills: list[Skill]) -> list[str]:
@@ -1347,6 +1416,9 @@ def _resolve_nano_banana_input_paths(
     explicit_paths = _extract_input_image_paths_from_text(llm_message)
     if explicit_paths:
         return explicit_paths
+    numbered_paths = _resolve_numbered_input_image_paths(session, llm_message)
+    if numbered_paths:
+        return numbered_paths
     relative_path = _resolve_relative_image_reference_path(session, llm_message)
     if relative_path:
         return [relative_path]
@@ -2418,30 +2490,41 @@ async def run_agent(
             and routed_skill_ids
             and routed_skill_ids != locked_skill_ids
         ):
-            switch_requested = any(
-                (
-                    _skill_explicitly_mentioned(skill, message)
-                    or _skill_trigger_mentioned(skill, message)
-                    or _raw_skill_trigger_mentioned(skill, message)
+            if (
+                "nano-banana-image-t8" in locked_skill_ids
+                and (
+                    _is_numbered_image_reference_edit_message(message)
+                    or _message_requests_image_regenerate(message)
                 )
-                for skill in routed_skills
-                if skill.id.strip().lower() not in set(locked_skill_ids)
-            )
-            if not switch_requested:
+            ):
                 routed_skill_ids = []
                 routed_skills = []
+                lockable_routed_skill_ids = []
             else:
-                requested_skills = "、".join(routed_skill_ids)
-                current_skills = "、".join(locked_skill_ids)
-                if session is not None:
-                    session.metadata["pending_skill_switch_ids"] = routed_skill_ids
-                    session.metadata["pending_skill_switch_message"] = llm_message
-                    metadata_dirty = True
-                return (
-                    f"当前会话仍锁定在 {current_skills} 技能。"
-                    f"如果你确实要切换到 {requested_skills}，请先回复“任务完成”，"
-                    "之后再重新输入目标命令。"
+                switch_requested = any(
+                    (
+                        _skill_explicitly_mentioned(skill, message)
+                        or _skill_trigger_mentioned(skill, message)
+                        or _raw_skill_trigger_mentioned(skill, message)
+                    )
+                    for skill in routed_skills
+                    if skill.id.strip().lower() not in set(locked_skill_ids)
                 )
+                if not switch_requested:
+                    routed_skill_ids = []
+                    routed_skills = []
+                else:
+                    requested_skills = "、".join(routed_skill_ids)
+                    current_skills = "、".join(locked_skill_ids)
+                    if session is not None:
+                        session.metadata["pending_skill_switch_ids"] = routed_skill_ids
+                        session.metadata["pending_skill_switch_message"] = llm_message
+                        metadata_dirty = True
+                    return (
+                        f"当前会话仍锁定在 {current_skills} 技能。"
+                        f"如果你确实要切换到 {requested_skills}，请先回复“任务完成”，"
+                        "之后再重新输入目标命令。"
+                    )
 
         active_skills_for_images = routed_skills
         if lock_is_explicit and locked_skill_ids:
