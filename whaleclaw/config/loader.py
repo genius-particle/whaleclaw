@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 from whaleclaw.config.paths import CONFIG_FILE
 from whaleclaw.config.schema import WhaleclawConfig
@@ -117,11 +118,17 @@ def set_default_agent_model(model: str, *, config_path: Path | None = None) -> N
     raw_cfg: dict[str, object] = _load_json(user_cfg) if user_cfg.exists() else {}
 
     agent_cfg = raw_cfg.get("agent")
+    agent_node: dict[str, object]
     if agent_cfg is None:
-        agent_node: dict[str, object] = {}
+        agent_node = {}
         raw_cfg["agent"] = agent_node
     elif isinstance(agent_cfg, dict):
-        agent_node = agent_cfg
+        raw_agent_cfg = cast(dict[object, object], agent_cfg)
+        agent_node = {}
+        for item_key, item_value in raw_agent_cfg.items():
+            if isinstance(item_key, str):
+                agent_node[item_key] = item_value
+        raw_cfg["agent"] = agent_node
     else:
         raise ConfigError("配置文件格式错误: agent 必须是对象")
 
