@@ -27,6 +27,7 @@ _NANO_BANANA_DEFAULT_MODEL_FILE = (
 )
 MAX_NATIVE_TOOLS = 12
 TOOL_POLICY_KEYWORDS: dict[tuple[str, ...], tuple[str, ...]] = {
+    ("桌面截图", "截图桌面", "截屏", "屏幕截图", "desktop screenshot"): ("desktop_capture",),
     ("ppt", "pptx", "幻灯片", "演示文稿"): ("ppt_edit", "file_edit", "patch_apply"),
     ("word", "docx", "文档"): ("docx_edit", "file_edit"),
     ("excel", "xlsx", "表格", "单元格"): ("xlsx_edit", "file_edit"),
@@ -559,6 +560,13 @@ def score_tool_relevance(user_message: str, tool: ToolDefinition) -> int:
     for keyword in keywords:
         if keyword and keyword in corpus:
             score += 1
+
+    if tool.name == "desktop_capture" and (
+        ("桌面" in query and ("截图" in query or "截屏" in query))
+        or "desktop screenshot" in query
+        or "screenshot" in query
+    ):
+        score += 6
 
     if ("图片" in query or "photo" in query or "image" in query) and tool.name in {
         "browser",

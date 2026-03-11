@@ -15,7 +15,8 @@ from whaleclaw.agent.helpers.tool_execution import is_transient_cli_usage_error
 from whaleclaw.agent.loop import _is_image_generation_request, _parse_fallback_tool_calls, run_agent
 from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.providers.base import AgentResponse, Message, ToolCall
-from whaleclaw.sessions.manager import Session
+from whaleclaw.sessions.manager import Session, SessionManager
+from whaleclaw.sessions.store import SessionStore
 from whaleclaw.skills.parser import Skill, SkillParamGuard, SkillParamItem
 from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
 from whaleclaw.tools.registry import ToolRegistry
@@ -56,6 +57,16 @@ async def test_run_agent_returns_reply() -> None:
 
     assert result == "你好！我是 WhaleClaw。"
     router.chat.assert_awaited_once()
+
+
+def test_select_native_tool_names_prefers_desktop_capture_for_desktop_screenshot() -> None:
+    registry = ToolRegistry()
+    registry.register(_BashProbeTool())
+    registry.register(_DesktopCaptureNoopTool())
+
+    selected = loop_mod.select_native_tool_names(registry, "把桌面截图一下")
+
+    assert "desktop_capture" in selected
 
 
 @pytest.mark.asyncio
@@ -251,6 +262,24 @@ class _BashProbeTool(Tool):
         if command:
             return ToolResult(success=True, output=f"ok:{command}")
         return ToolResult(success=False, output="", error="bad command")
+
+
+class _DesktopCaptureNoopTool(Tool):
+    """Dummy desktop_capture tool for tool-selection assertions."""
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="desktop_capture",
+            description="Capture macOS desktop screenshot.",
+            parameters=[
+                ToolParameter(name="wake", type="boolean", description="wake display"),
+                ToolParameter(name="delay_ms", type="integer", description="delay"),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:  # noqa: ARG002
+        return ToolResult(success=True, output="desktop captured")
 
 
 class _BashAlwaysFailTool(Tool):
@@ -1749,6 +1778,82 @@ async def test_run_agent_unlocks_locked_skill_even_when_waiting_done_flag_is_fal
     assert "skill_lock_waiting_done" not in session.metadata
     assert "skill_param_state" not in session.metadata
     router.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_task_done_clears_persisted_skill_lock(tmp_path: Path) -> None:
+    store = SessionStore(db_path=tmp_path / "unlock.db")
+    await store.open()
+    try:
+        manager = SessionManager(store, WhaleclawConfig())
+        session = await manager.create("webchat", "unlock-user")
+        session.metadata = {
+            "locked_skill_ids": ["nano-banana-image-t8"],
+            "skill_lock_waiting_done": True,
+            "skill_param_state": {
+                "nano-banana-image-t8": {
+                    "api_key": "__present__",
+                    "prompt": "旧任务",
+                }
+            },
+        }
+        await manager.update_metadata(session, session.metadata)
+
+        router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+        result = await run_agent(
+            message="任务完成",
+            session_id=session.id,
+            config=WhaleclawConfig(),
+            router=router,
+            session=session,
+            session_manager=manager,
+        )
+
+        assert result == "已确认任务完成，已解除本轮技能锁定。"
+        reloaded = await manager.get(session.id)
+        assert reloaded is not None
+        assert "locked_skill_ids" not in reloaded.metadata
+        assert "skill_lock_waiting_done" not in reloaded.metadata
+        assert "skill_param_state" not in reloaded.metadata
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_skill_lock_status_question_uses_persisted_metadata(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(db_path=tmp_path / "lock_status.db")
+    await store.open()
+    try:
+        manager = SessionManager(store, WhaleclawConfig())
+        persisted = await manager.create("webchat", "lock-status-user")
+        stale_session = Session(
+            id=persisted.id,
+            channel=persisted.channel,
+            peer_id=persisted.peer_id,
+            messages=[],
+            model=persisted.model,
+            created_at=persisted.created_at,
+            updated_at=persisted.updated_at,
+            metadata={"locked_skill_ids": ["nano-banana-image-t8"]},
+        )
+        await store.update_session_field(persisted.id, metadata={})
+
+        router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+        result = await run_agent(
+            message="现在被锁定在哪个技能里面？",
+            session_id=stale_session.id,
+            config=WhaleclawConfig(),
+            router=router,
+            session=stale_session,
+            session_manager=manager,
+        )
+
+        assert result == "当前没有技能锁定。"
+        router.chat.assert_not_called()
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -4223,6 +4328,85 @@ async def test_nano_banana_control_message_switches_model_without_running_genera
 
     assert "已切换本次生图模型为：香蕉2" in result
     assert bash_tool.commands == []
+
+
+@pytest.mark.asyncio
+async def test_nano_banana_activation_message_uses_guard_reply_after_unlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["香蕉生图", "香蕉文生图", "香蕉图生图"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(
+                    key="api_key",
+                    label="API Key",
+                    type="api_key",
+                    required=True,
+                    prompt="请提供 Nano Banana API Key",
+                ),
+                SkillParamItem(
+                    key="prompt",
+                    label="提示词",
+                    type="text",
+                    required=True,
+                    aliases=["提示词", "prompt"],
+                    prompt="请提供提示词",
+                ),
+                SkillParamItem(
+                    key="images",
+                    label="图生图图片",
+                    type="images",
+                    required=False,
+                    min_count=1,
+                    prompt="图生图时请上传至少 1 张图片",
+                ),
+            ],
+        ),
+        source_path=Path("/tmp/nano_guard_activation_after_unlock.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        loop_mod,
+        "_load_saved_nano_banana_model_display",
+        lambda: "香蕉2",
+    )
+
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-activation-after-unlock",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={},
+    )
+
+    result = await run_agent(
+        message="使用香蕉生图",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "我将使用 nano-banana-image-t8 技能继续完成任务。" in result
+    assert "我先确认参数（缺啥补啥）：" in result
+    assert "提示词：未提供" in result
+    assert "请补充：" in result
+    router.chat.assert_not_called()
 
 
 @pytest.mark.asyncio

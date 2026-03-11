@@ -323,6 +323,11 @@ _TASK_DONE_INTENT_RE = re.compile(
     r"(?:任务.{0,4}(?:完成|结束)|(?:完成|结束).{0,4}任务|收尾|结束本轮|这轮结束|本轮结束)",
     re.IGNORECASE,
 )
+_SKILL_LOCK_STATUS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:现在|当前).{0,8}(?:被)?锁定在.{0,8}(?:哪个|什么).{0,6}(?:技能|skill)"),
+    re.compile(r"(?:现在|当前).{0,6}(?:技能|skill).{0,6}(?:锁定|状态)"),
+    re.compile(r"(?:锁定在.{0,8}(?:哪个|什么).{0,6}(?:技能|skill))"),
+)
 _SKILL_SWITCH_CONSENT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:同意|可以|确认|允许).{0,8}(?:切换|换).{0,8}(?:技能|skill)?", re.IGNORECASE),
     re.compile(r"(?:切换|换).{0,8}(?:技能|skill).{0,8}(?:吧|可以|行|好的|ok)", re.IGNORECASE),
@@ -935,6 +940,52 @@ def _message_requests_image_edit(message: str) -> bool:
 def _message_requests_image_regenerate(message: str) -> bool:
     """Detect reruns that should go back to the original input image set."""
     return bool(_IMAGE_REGENERATE_RE.search(message))
+
+
+def _is_skill_lock_status_question(message: str) -> bool:
+    """Detect direct questions asking which skill the session is locked to."""
+    text = message.strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _SKILL_LOCK_STATUS_PATTERNS)
+
+
+def _extract_locked_skill_ids_from_metadata(metadata: object) -> list[str]:
+    """Normalize locked skill ids from arbitrary session metadata."""
+    if not isinstance(metadata, dict):
+        return []
+    raw_locked = metadata.get("locked_skill_ids")
+    if isinstance(raw_locked, list):
+        return [
+            str(item).strip().lower()
+            for item in raw_locked
+            if isinstance(item, str) and str(item).strip()
+        ]
+    raw_forced = metadata.get("forced_skill_id")
+    if isinstance(raw_forced, str) and raw_forced.strip():
+        return [raw_forced.strip().lower()]
+    return []
+
+
+def _build_skill_lock_status_reply(session: Session | None) -> str:
+    """Render the current skill-lock status from persisted metadata."""
+    locked_skill_ids = _extract_locked_skill_ids_from_metadata(
+        session.metadata if session is not None else None
+    )
+    if not locked_skill_ids:
+        return "当前没有技能锁定。"
+    current_skills = "、".join(locked_skill_ids)
+    if "nano-banana-image-t8" in locked_skill_ids:
+        model_display = _resolve_nano_banana_model_display(session)
+        return (
+            f"现在锁定在技能：{current_skills}。\n"
+            f"当前本轮模型：{model_display}。\n"
+            "要解除锁定，回复“任务完成”即可。"
+        )
+    return (
+        f"现在锁定在技能：{current_skills}。\n"
+        "要解除锁定，回复“任务完成”即可。"
+    )
 
 
 def _skill_requires_images(skills: list[Skill]) -> bool:
@@ -1826,9 +1877,7 @@ async def _sync_multi_agent_compression_boundary(
                 error=str(exc),
                 enabled=ma_enabled,
             )
-    if changed:
-        await _persist_session_metadata(session, session_manager)
-    if session_manager is None:
+    if not changed or session_manager is None:
         return None
     try:
         await asyncio.wait_for(
@@ -2204,6 +2253,14 @@ async def run_agent(
             skill_announce_pending = bool(session.metadata.get("skill_lock_announce_pending"))
             raw_pending_switch_ids = session.metadata.get("pending_skill_switch_ids")
             raw_pending_switch_message = session.metadata.get("pending_skill_switch_message")
+        if _is_skill_lock_status_question(message):
+            status_session = session
+            if session is not None and session_manager is not None:
+                refreshed_session = await session_manager.get(session.id)
+                if refreshed_session is not None:
+                    session.metadata = refreshed_session.metadata
+                    status_session = refreshed_session
+            return _build_skill_lock_status_reply(status_session)
         previous_locked_skill_ids = list(locked_skill_ids)
         pending_switch_skill_ids: list[str] = []
         pending_switch_message = ""
@@ -2311,10 +2368,7 @@ async def run_agent(
                 session.metadata.pop("pending_skill_switch_message", None)
                 session.metadata.pop("skill_param_state", None)
                 if session_manager is not None:
-                    await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-                        session.id,
-                        metadata=session.metadata,
-                    )
+                    await session_manager.update_metadata(session, session.metadata)
             return "已确认任务完成，已解除本轮技能锁定。"
         elif (
             lock_waiting_done
@@ -2436,6 +2490,11 @@ async def run_agent(
             and "nano-banana-image-t8" in locked_skill_ids
             and _is_nano_banana_control_message(llm_message)
         )
+        nano_banana_activation_only = (
+            lock_is_explicit
+            and "nano-banana-image-t8" in locked_skill_ids
+            and _is_nano_banana_activation_message(llm_message)
+        )
         nano_banana_execution_request = _is_nano_banana_execution_request(
             message=llm_message,
             has_new_input_images=has_new_input_images,
@@ -2533,6 +2592,7 @@ async def run_agent(
                 if (
                     "nano-banana-image-t8" in forced_skill_ids
                     and nano_banana_control_only
+                    and not nano_banana_activation_only
                 ):
                     if session_manager is not None:
                         await session_manager.update_metadata(session, session.metadata)
